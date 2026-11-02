@@ -1,10 +1,12 @@
 # syntax=docker/dockerfile:1.7
 #
-# Custom Dakota image: proprietary NVIDIA driver on the legacy 580.xxx
-# branch (for a GPU generation no longer supported by the official
-# dakota-nvidia / dakota-nvidia-gaming variants, which track the newer
-# branch, ~610.x/615.x as of 2026) + the lbssousa/libfprint fork
-# (Goodix 538d) + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
+# Custom Dakota image for one specific notebook, the Dell Inspiron 14
+# 5490 (regulatory model P116G): proprietary NVIDIA driver on the legacy
+# 580.xxx branch (its GeForce MX230 is a Pascal GP108M, no longer
+# supported by the official dakota-nvidia / dakota-nvidia-gaming
+# variants, which track the newer branch, ~610.x/615.x as of 2026) +
+# the lbssousa/libfprint fork (for its Goodix 538d fingerprint reader)
+# + Yubico's pam-u2f (YubiKey FIDO2/U2F PAM module +
 # pamu2fcfg) + OpenSSH and GCR's ssh-agent patched for security key
 # (FIDO) PIN/touch prompts + fish as the default login shell, baked in
 # via downstream OCI image layering — not via forking the upstream
@@ -30,12 +32,11 @@
 # /usr/lib/modules/<kver>/config. See scripts/build-kernel-src.sh and
 # README.md for the full derivation and its residual risks.
 
-# Latest release of the 580 branch, which is what this repo is named
-# for and builds. Bumping WITHIN the branch is routine — the
+# Latest release of the 580 branch, which is what this repo builds.
+# Bumping WITHIN the branch is routine — the
 # .github/workflows/nvidia-driver-update.yml watcher opens a PR for it.
 # Changing the branch (590/595/610/615 are all published too, and still
-# list this repo's target Pascal GPUs as current) is not: it would make
-# the "580" in the repo and image names wrong, and the kernel-7.x
+# list the notebook's Pascal MX230 as current) is not: the kernel-7.x
 # workarounds in scripts/build-nvidia.sh would need re-deriving. The
 # watcher therefore reports a newer branch without ever proposing it.
 ARG NVIDIA_VERSION=580.196.07
@@ -115,7 +116,7 @@ ARG LIBCUPSFILTERS_SHA256=0a22b849d5068c4c86b20fbb4192d3faa3dabcc9ee844c8fd73710
 # The `next` branch overrides this to "next" and repins the two base
 # digests below to the upstream :next images, so the two streams
 # differ by nothing but these three ARG values.
-ARG IMAGE_NAME=dakota-nvidia-580
+ARG IMAGE_NAME=dakota-inspiron-5490
 ARG IMAGE_VENDOR=lbssousa
 ARG IMAGE_TAG=testing
 
@@ -917,11 +918,11 @@ RUN set -eux; \
     test -x /usr/libexec/dakota-secure-boot; \
     test -f /usr/lib/dakota/secure-boot/shimx64.efi; \
     command -v mokutil; \
-    test -f /usr/lib/dakota-nvidia-580/secure-boot/module-signing.der; \
+    test -f /usr/lib/dakota-inspiron-5490/secure-boot/module-signing.der; \
     [ "${ALLOW_UNSIGNED_MODULES}" = 1 ] && exit 0; \
     kver="$(cat /kernel-version)"; \
     signer="$(openssl x509 -inform DER -noout -subject -nameopt multiline \
-        -in /usr/lib/dakota-nvidia-580/secure-boot/module-signing.der \
+        -in /usr/lib/dakota-inspiron-5490/secure-boot/module-signing.der \
         | sed -n 's/^ *commonName *= *//p')"; \
     for ko in /usr/lib/modules/"$kver"/extra/nvidia*.ko; do \
         [ "$(modinfo -F signer "$ko")" = "$signer" ]; \

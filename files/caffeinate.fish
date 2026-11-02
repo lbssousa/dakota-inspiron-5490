@@ -1,6 +1,6 @@
 # fish counterpart of the base's /etc/profile.d/caffeinate.sh (from
 # projectbluefin/common), which only bash reads. Shipped by
-# dakota-nvidia-580; autoloaded from vendor_functions.d.
+# dakota-inspiron-5490; autoloaded from vendor_functions.d.
 function caffeinate --description 'Prevent the system from sleeping, like macOS caffeinate'
     # Usage: caffeinate              — hold indefinitely (Ctrl+C to release)
     #        caffeinate sleep 3600   — hold while command runs

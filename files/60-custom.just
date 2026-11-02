@@ -20,7 +20,7 @@ gnome-pure-toggle ACTION="toggle":
     set -euo pipefail
 
     action="{{ ACTION }}"
-    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dakota-nvidia-580"
+    state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/dakota-inspiron-5490"
     marker="$state_dir/gnome-pure"
     skip_schemas="org.gnome.desktop.background org.gnome.desktop.screensaver"
 
@@ -77,7 +77,7 @@ gnome-pure-toggle ACTION="toggle":
 enroll-nvidia-secure-boot-key:
     #!/usr/bin/bash
     set -euo pipefail
-    cert=/usr/lib/dakota-nvidia-580/secure-boot/module-signing.der
+    cert=/usr/lib/dakota-inspiron-5490/secure-boot/module-signing.der
     if [ ! -t 0 ]; then
         echo "Interactive terminal required" >&2
         exit 1
@@ -96,8 +96,9 @@ enroll-nvidia-secure-boot-key:
     # covers both keys.
     printf 'dakota\ndakota\n' | sudo mokutil --ignore-keyring --import "$cert"
     sudo mokutil --timeout -1
+    cn="$(openssl x509 -inform DER -in "$cert" -noout -subject -nameopt multiline | sed -n 's/^ *commonName *= *//p')"
     echo "Queued. Reboot, choose \"Enroll MOK\" in MokManager, check that it lists"
-    echo "BOTH keys (Dakota's and \"dakota-nvidia-580 module signing key\"),"
+    echo "BOTH keys (Dakota's and \"$cn\"),"
     echo "then \"Continue\", \"Yes\", password \"dakota\", \"Reboot\"."
 
 # Show whether the NVIDIA modules can load under Dakota's lockdown
@@ -105,7 +106,7 @@ enroll-nvidia-secure-boot-key:
 nvidia-secure-boot-status:
     #!/usr/bin/bash
     set -uo pipefail
-    cert=/usr/lib/dakota-nvidia-580/secure-boot/module-signing.der
+    cert=/usr/lib/dakota-inspiron-5490/secure-boot/module-signing.der
     cn="$(openssl x509 -inform DER -in "$cert" -noout -subject -nameopt multiline | sed -n 's/^ *commonName *= *//p')"
     echo "Secure Boot:      $(mokutil --sb-state 2>/dev/null | head -n1)"
     echo "Kernel lockdown:  $(cat /sys/kernel/security/lockdown 2>/dev/null || echo unavailable)"

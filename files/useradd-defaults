@@ -1,4 +1,4 @@
-# /etc/default/useradd — shipped by dakota-nvidia-580.
+# /etc/default/useradd — shipped by dakota-inspiron-5490.
 #
 # Only SHELL differs from shadow's built-in defaults: new accounts
 # (useradd, and therefore AccountsService / gnome-initial-setup, which
