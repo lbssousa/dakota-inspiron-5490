@@ -45,7 +45,7 @@ ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 # release point, so bumping this value is a deliberate, visible change.
 # Check https://github.com/lbssousa/libfprint/tags for newer releases
 # before bumping.
-ARG LIBFPRINT_REF=v1.94.100-goodix538d.1
+ARG LIBFPRINT_REF=v1.94.100-goodix538d.2
 # pam-u2f (upstream Yubico, not a fork): provides pam_u2f.so + pamu2fcfg,
 # the PAM module and enrollment CLI needed to use a YubiKey for FIDO2/U2F
 # PAM authentication — neither can come from Homebrew, since PAM modules

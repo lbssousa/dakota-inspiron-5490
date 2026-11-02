@@ -25,7 +25,7 @@ model, so the repo and images use the model name.
   longer supported by the official `dakota-nvidia`/`dakota-nvidia-gaming`
   variants, which track the newer branch (~610.x/615.x as of 2026).
 - **[lbssousa/libfprint](https://github.com/lbssousa/libfprint) fork**
-  (pinned to tag `v1.94.100-goodix538d.1`), adding support for the
+  (pinned to tag `v1.94.100-goodix538d.2`), adding support for the
   notebook's Goodix 538d fingerprint reader — the same fork used in
   [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
   (`playbooks/dakota/libfprint.yml`), which installs it at **runtime**
