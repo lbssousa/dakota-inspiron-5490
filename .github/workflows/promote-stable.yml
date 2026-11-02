@@ -25,7 +25,7 @@ on:
   workflow_dispatch: {}
 
 env:
-  IMAGE_NAME: ghcr.io/lbssousa/dakota-nvidia-580
+  IMAGE_NAME: ghcr.io/lbssousa/dakota-inspiron-5490
 
 permissions:
   contents: read

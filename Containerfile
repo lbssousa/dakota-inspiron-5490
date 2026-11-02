@@ -28,12 +28,11 @@
 # /usr/lib/modules/<kver>/config. See scripts/build-kernel-src.sh and
 # README.md for the full derivation and its residual risks.
 
-# Latest release of the 580 branch, which is what this repo is named
-# for and builds. Bumping WITHIN the branch is routine — the
+# Latest release of the 580 branch, which is what this repo builds.
+# Bumping WITHIN the branch is routine — the
 # .github/workflows/nvidia-driver-update.yml watcher opens a PR for it.
 # Changing the branch (590/595/610/615 are all published too, and still
-# list this repo's target Pascal GPUs as current) is not: it would make
-# the "580" in the repo and image names wrong, and the kernel-7.x
+# list the notebook's Pascal MX230 as current) is not: the kernel-7.x
 # workarounds in scripts/build-nvidia.sh would need re-deriving. The
 # watcher therefore reports a newer branch without ever proposing it.
 ARG NVIDIA_VERSION=580.178.04
@@ -108,7 +107,7 @@ ARG DISABLE_BLUEFIN_GNOME_TWEAKS=true
 # The `next` branch overrides this to "next" and repins the two base
 # digests below to the upstream :next images, so the two streams
 # differ by nothing but these three ARG values.
-ARG IMAGE_NAME=dakota-nvidia-580
+ARG IMAGE_NAME=dakota-inspiron-5490
 ARG IMAGE_VENDOR=lbssousa
 ARG IMAGE_TAG=next
 
@@ -609,7 +608,7 @@ RUN set -eux; \
 #             '' \
 #             '[org.gnome.shell]' \
 #             "disabled-extensions=['blur-my-shell@aunetx', 'dash-to-dock@micxgx.gmail.com']" \
-#             > /usr/share/glib-2.0/schemas/zz9-dakota-nvidia-580-gnome-tweaks.gschema.override; \
+#             > /usr/share/glib-2.0/schemas/zz9-dakota-inspiron-5490-gnome-tweaks.gschema.override; \
 #         glib-compile-schemas /usr/share/glib-2.0/schemas; \
 #     fi
 
