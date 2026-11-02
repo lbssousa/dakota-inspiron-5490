@@ -197,8 +197,7 @@ jobs:
           ## Note: a newer branch is published
 
           NVIDIA also publishes a \`${NEWEST_BRANCH}.x\` branch. This watcher
-          never proposes a branch change: it would make the "${BRANCH}" in the
-          repo and image names wrong, and the kernel-7.x workarounds in
+          never proposes a branch change: the kernel-7.x workarounds in
           \`build-nvidia.sh\` would need re-deriving. That is a deliberate
           manual decision — see the \`ARG NVIDIA_VERSION\` comment in the
           Containerfile.
