@@ -669,6 +669,26 @@ RUN set -eux; \
     install -D -m0755 .libs/libcupsfilters.so.2.0.0 -t /out/usr/lib/x86_64-linux-gnu/
 
 # ---------------------------------------------------------------------
+# libfuse2 — the FUSE 2 library (libfuse.so.2) that AppImages built
+# with the classic type-2 runtime dlopen to mount themselves. The base
+# ships only FUSE 3 (libfuse3, fusermount3, with fusermount as a
+# symlink to it), so those AppImages fail with "dlopen(): error loading
+# libfuse.so.2". AppImages built with the newer static runtime need
+# only fusermount, which the base already has.
+#
+# Only the library comes from Fedora's fuse-libs: it links nothing but
+# libc, and mounts by exec'ing /usr/bin/fusermount, which fusermount3
+# serves (same approach as Ubuntu's libfuse2t64 on a fuse3 system).
+# Fedora's fusermount (FUSE 2) is NOT shipped: the base's setuid
+# fusermount3 stays the only mount helper.
+# ---------------------------------------------------------------------
+FROM fedora:44 AS libfuse2-builder
+RUN dnf install -y fuse-libs && dnf clean all && \
+    install -D -m0755 /usr/lib64/libfuse.so.2.9.9 \
+        /out/usr/lib/x86_64-linux-gnu/libfuse.so.2.9.9 && \
+    ln -s libfuse.so.2.9.9 /out/usr/lib/x86_64-linux-gnu/libfuse.so.2
+
+# ---------------------------------------------------------------------
 # final — Dakota + all payloads, baked into the image. /usr is
 # writable during the build (it only becomes read-only at runtime via
 # composefs), so writing straight into it — including overwriting the
@@ -689,6 +709,7 @@ COPY --from=pam-u2f-builder /out/usr/ /usr/
 COPY --from=openssh-builder /out/usr/ /usr/
 COPY --from=gcr-builder /out/usr/ /usr/
 COPY --from=libcupsfilters-builder /out/usr/ /usr/
+COPY --from=libfuse2-builder /out/usr/ /usr/
 COPY files/nvidia-blacklist-nouveau.conf /usr/lib/modprobe.d/nvidia-blacklist-nouveau.conf
 
 # Module options for nvidia.ko / nvidia-drm.ko, applied at load time.
@@ -933,7 +954,7 @@ RUN set -eux; \
 # that Dakota's own docs/oci-assembly.md describes as "load-bearing —
 # removing it breaks the image in ways that only show up after a
 # bootc switch", needed here because we replaced libfprint-2.so and
-# added new NVIDIA .so files.
+# added new NVIDIA .so files and libfuse.so.2.
 RUN kver="$(cat /kernel-version)" && \
     depmod -a "$kver" && \
     ldconfig -r / && \
@@ -970,5 +991,16 @@ RUN set -eux; \
     done; \
     grep -q goodixtls53xd "${libdir}/libfprint-2.so.2"; \
     rm -f /libfprint-libdir
+
+# AppImage support: libfuse.so.2 must be in the loader cache (AppImages
+# dlopen it by soname) and resolve against the base, and the fusermount
+# it execs must still be the base's setuid fusermount3.
+RUN set -eux; \
+    ldconfig -p | grep -q 'libfuse\.so\.2 .*=> /usr/lib/x86_64-linux-gnu/libfuse\.so\.2$'; \
+    if ldd /usr/lib/x86_64-linux-gnu/libfuse.so.2 | grep -q 'not found'; then \
+        ldd /usr/lib/x86_64-linux-gnu/libfuse.so.2 >&2; exit 1; \
+    fi; \
+    [ "$(readlink -f /usr/bin/fusermount)" = /usr/bin/fusermount3 ]; \
+    test -u /usr/bin/fusermount3
 
 RUN bootc container lint

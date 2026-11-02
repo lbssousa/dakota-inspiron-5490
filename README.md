@@ -118,6 +118,17 @@ model, so the repo and images use the model name.
   `--without-jpegxl` because the builder's libjxl (0.11) is older than the
   base's (0.12), so JPEG XL input images are not converted by the image
   filters. Drop the stage once the base carries both fixes.
+- **FUSE 2 library for AppImages** — the base ships only FUSE 3
+  (`libfuse3`, `fusermount3`, with `fusermount` linked to it), so
+  AppImages built with the classic type-2 runtime, which `dlopen()`
+  `libfuse.so.2`, fail with "dlopen(): error loading libfuse.so.2".
+  `libfuse.so.2` (2.9.9) is copied from Fedora's `fuse-libs`; it links
+  only libc and mounts through `/usr/bin/fusermount`, so the base's
+  setuid `fusermount3` stays the only mount helper (Fedora's FUSE 2
+  `fusermount` is not shipped). AppImages built with the newer static
+  runtime need only `fusermount` and already worked. The final stage
+  fails the build if the library stops resolving or `fusermount` stops
+  pointing at the setuid `fusermount3`.
 - **fish as the default login shell, with bash kept** — both come from
   the Dakota base. New accounts get fish through `/etc/default/useradd`;
   existing ones are switched once per machine. See ["Default
@@ -596,6 +607,10 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
   │           builds that version + files/libcupsfilters-*.patch,
   │           keeping only libcupsfilters.so.2.0.0
   │
+  ├─→ libfuse2-builder        (Fedora, not derived from the base)
+  │                           copies libfuse.so.2 out of Fedora's
+  │                           fuse-libs, for AppImages
+  │
   └─→ final (FROM dakota-base again)
         COPY of the /out trees (libfprint's overwrites the
         stock library in place; pam-u2f's adds new files alongside
@@ -609,13 +624,16 @@ dakota-base (FROM ${BASE_IMAGE}, e.g. ghcr.io/projectbluefin/dakota:testing@sha2
 ```
 
 The `kernel-src-builder`, `nvidia-builder`, `nvidia-signer`, `libfprint-builder`,
-`pam-u2f-builder`, `openssh-builder` and `gcr-builder` stages use
+`pam-u2f-builder`, `openssh-builder`, `gcr-builder`,
+`libcupsfilters-builder` and `libfuse2-builder` stages use
 Fedora **only as a
 build environment** (it has `dnf`, `gcc`, `meson`, `cmake`,
 `rpm2cpio`...) — nothing from them ends up in the final image except
 what the scripts/build commands explicitly package into `/out`. The
 final image is still plain Dakota (GNOME OS, no RPMs) with these
-payloads layered on top.
+payloads layered on top. The one binary taken from a Fedora package
+as-is rather than built here is `libfuse.so.2` (from `fuse-libs`); no
+RPM metadata comes with it.
 
 ## How the libfprint overwrite works
 
