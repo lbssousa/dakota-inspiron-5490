@@ -45,7 +45,7 @@ ARG LIBFPRINT_REPO=https://github.com/lbssousa/libfprint.git
 # release point, so bumping this value is a deliberate, visible change.
 # Check https://github.com/lbssousa/libfprint/tags for newer releases
 # before bumping.
-ARG LIBFPRINT_REF=v1.94.100-goodix538d.1
+ARG LIBFPRINT_REF=v1.94.100-goodix538d.2
 # pam-u2f (upstream Yubico, not a fork): provides pam_u2f.so + pamu2fcfg,
 # the PAM module and enrollment CLI needed to use a YubiKey for FIDO2/U2F
 # PAM authentication — neither can come from Homebrew, since PAM modules
@@ -779,6 +779,24 @@ RUN cd /usr/lib/systemd/system && \
 # for the full chain from that timeout to the lock screen occasionally
 # showing no password/fingerprint prompt at all.
 COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
+
+# Kills the excess when gdm-session-worker processes pile up on the lock
+# screen, before they use up root's system-bus connections and take the
+# password prompt with them; never a session leader. Contains the flood, its
+# cause is still open: see README.md, "Lock screen occasionally shows no
+# password/fingerprint prompt". Enabled by a /usr symlink, not a preset — see
+# the NVIDIA units above. Fail here if a base bump drops a tool it depends on,
+# since at runtime that would only show up as a watchdog that never acts.
+COPY files/gdm-worker-watchdog.sh /usr/libexec/gdm-worker-watchdog
+COPY files/gdm-worker-watchdog.service /usr/lib/systemd/system/gdm-worker-watchdog.service
+RUN set -eux; \
+    ln -s ../gdm-worker-watchdog.service \
+        /usr/lib/systemd/system/multi-user.target.wants/; \
+    test -x /usr/libexec/gdm-worker-watchdog; \
+    bash -n /usr/libexec/gdm-worker-watchdog; \
+    for tool in pgrep awk getconf busctl journalctl loginctl ps timeout; do \
+        command -v "$tool"; \
+    done
 
 # Makes a YubiKey that was already plugged in at boot visible to GnuPG
 # (`gpg --card-status`) without hand-restarting pcscd first. Replaces
