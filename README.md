@@ -1,18 +1,32 @@
-# dakota-nvidia-580
+# dakota-inspiron-5490
 
 A customized [Bluefin Dakota](https://docs.projectbluefin.io/dakota/)
-image with the components below baked in via downstream OCI image layering
-(not by forking the upstream BuildStream build — see ["Why downstream
-instead of forking
-BuildStream"](#why-downstream-instead-of-forking-buildstream) below):
+image built for **one specific notebook, the Dell Inspiron 14 5490**,
+not for NVIDIA hardware in general. The components below are baked in
+via downstream OCI image layering (not by forking the upstream
+BuildStream build — see ["Why downstream instead of forking
+BuildStream"](#why-downstream-instead-of-forking-buildstream) below).
+
+Target hardware:
+
+| Component   | Detail                                                        |
+|-------------|---------------------------------------------------------------|
+| Model       | Dell Inspiron 14 5490 (regulatory model P116G)                |
+| CPU / iGPU  | Intel Comet Lake-U (10th gen Core), UHD Graphics (`8086:9b41`) |
+| dGPU        | NVIDIA GeForce MX230, GP108M / Pascal (`10de:1d11`)           |
+| Fingerprint | Goodix 538d (`27c6:538d`)                                     |
+
+The image may boot on other machines, but nothing here is tested or
+tuned for them. Dell doesn't publish an internal codename for this
+model, so the repo and images use the model name.
 
 - **Proprietary NVIDIA driver on the legacy 580.xxx branch** — needed
-  because the target GPU is from a generation no longer supported by
-  the official `dakota-nvidia`/`dakota-nvidia-gaming` variants, which
-  track the newer branch (~610.x/615.x as of 2026).
+  because the notebook's GeForce MX230 is a Pascal GPU, a generation no
+  longer supported by the official `dakota-nvidia`/`dakota-nvidia-gaming`
+  variants, which track the newer branch (~610.x/615.x as of 2026).
 - **[lbssousa/libfprint](https://github.com/lbssousa/libfprint) fork**
   (pinned to tag `v1.94.100-goodix538d.1`), adding support for the
-  Goodix 538d fingerprint reader — the same fork used in
+  notebook's Goodix 538d fingerprint reader — the same fork used in
   [lbssousa/bluefin-initial-setup](https://github.com/lbssousa/bluefin-initial-setup)
   (`playbooks/dakota/libfprint.yml`), which installs it at **runtime**
   via distrobox for Dakota hosts not using this custom image. Here it
@@ -130,10 +144,30 @@ build cadences:
 See ["CI and automatic updates"](#ci-and-automatic-updates) for the
 schedules and how `:next` gets triggered.
 
-  - `ghcr.io/lbssousa/dakota-nvidia-580` — standard Dakota base.
-  - `ghcr.io/lbssousa/dakota-nvidia-580-gaming` — Dakota gaming base
+  - `ghcr.io/lbssousa/dakota-inspiron-5490` — standard Dakota base.
+  - `ghcr.io/lbssousa/dakota-inspiron-5490-gaming` — Dakota gaming base
     (Open Gaming Collective/OGC kernel, Steam, gamescope, etc.),
     mirroring the upstream `dakota-nvidia`/`dakota-nvidia-gaming` split.
+
+### Migrating from `dakota-nvidia-580`
+
+This project used to be called `dakota-nvidia-580`, and its images were
+published as `ghcr.io/lbssousa/dakota-nvidia-580[-gaming]`. Those
+images no longer get updates. To move a machine over:
+
+```bash
+sudo bootc switch ghcr.io/lbssousa/dakota-inspiron-5490:stable
+# or: sudo bootc switch ghcr.io/lbssousa/dakota-inspiron-5490-gaming:stable
+```
+
+- The NVIDIA module signing certificate is unchanged (its CN still reads
+  "dakota-nvidia-580 module signing key"), so the already-enrolled MOK
+  keeps working and nothing needs re-enrolling.
+- The on-disk paths were renamed as well (`/usr/lib/dakota-inspiron-5490`,
+  `/var/lib/dakota-inspiron-5490`, `~/.local/state/dakota-inspiron-5490`),
+  so on the first boot the bash → fish login shell migration runs once
+  more (see ["Default shell"](#default-shell)), and `ujust
+  gnome-pure-toggle` forgets its previous state.
 
 ## Status
 
@@ -1101,7 +1135,7 @@ back at any time.
 - **Existing accounts** — `fish-default-shell-migrate.service` runs
   once per machine, before user sessions start. It moves every account
   with UID 1000–59999 still on `/bin/bash` or `/usr/bin/bash` to fish,
-  then writes `/var/lib/dakota-nvidia-580/fish-default-shell-migrated`.
+  then writes `/var/lib/dakota-inspiron-5490/fish-default-shell-migrated`.
   Because of that marker, someone who later goes back to bash with
   `chsh` stays on bash. Delete the marker to run it again.
 - **Environment** — Homebrew's fish hook ships in the base
@@ -1148,7 +1182,7 @@ the kernel trusts:
   our certificate as its signer.
 - **Trust at boot.** The certificate
   (`files/secure-boot/module-signing.crt`, shipped as
-  `/usr/lib/dakota-nvidia-580/secure-boot/module-signing.der`) has to be
+  `/usr/lib/dakota-inspiron-5490/secure-boot/module-signing.der`) has to be
   enrolled as a **MOK**. Shim passes enrolled MOKs to the kernel's
   `.machine` keyring (`CONFIG_INTEGRITY_MACHINE_KEYRING`, enabled in
   Dakota's kernel), which module verification trusts. This only works
@@ -1173,7 +1207,8 @@ the kernel trusts:
 Until the key is enrolled, the NVIDIA modules don't load. Because
 `nvidia-kargs.toml` disables simpledrm, the screen can stay **black**,
 TTYs included. So the first time a machine moves to an image built on
-a signed base (from an older `dakota-nvidia-580` or from stock Dakota):
+a signed base (from an older build of this image, including one
+published as `dakota-nvidia-580`, or from stock Dakota):
 
 1. Boot it. If the screen comes up (or over SSH), run
    `ujust enroll-nvidia-secure-boot-key` and reboot into MokManager.
@@ -1408,7 +1443,7 @@ reconstructs itself from upstream source + the image's own shipped
   `/usr/share/ublue-os/image-info.json`, not `/etc/os-release`** — see
   `github.com/projectbluefin/uwelcome`, `internal/system/system.go`,
   `GetImageInfo()`. The final stage overwrites both files with this
-  image's own identity (`ghcr.io/lbssousa/dakota-nvidia-580[-gaming]`),
+  image's own identity (`ghcr.io/lbssousa/dakota-inspiron-5490[-gaming]`),
   in the same JSON shape upstream's own build generates (see
   `ublue-os/bluefin`'s `build_files/base/00-image-info.sh`); the
   `/etc/os-release` fields are kept in sync too, as a Universal Blue
@@ -1502,7 +1537,7 @@ skopeo inspect docker://ghcr.io/projectbluefin/dakota-gaming:testing | jq -r .Di
 #    the module signing key (see "Secure Boot and module signing"):
 podman build --file Containerfile \
   --secret id=module_signing_key,src=/path/to/module-signing.key \
-  --tag localhost/dakota-nvidia-580:dev .
+  --tag localhost/dakota-inspiron-5490:dev .
 #    Without the key, add --build-arg ALLOW_UNSIGNED_MODULES=1 instead:
 #    the build succeeds, but those modules won't load on Dakota.
 
@@ -1511,22 +1546,22 @@ podman build --file Containerfile \
 podman build --file Containerfile \
   --secret id=module_signing_key,src=/path/to/module-signing.key \
   --build-arg BASE_IMAGE=ghcr.io/projectbluefin/dakota-gaming:testing@sha256:<digest> \
-  --tag localhost/dakota-nvidia-580-gaming:dev .
+  --tag localhost/dakota-inspiron-5490-gaming:dev .
 
 # 4. Basic smoke test before installing on any real machine:
-podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia
-podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-drm
-podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-uvm
-podman run --rm localhost/dakota-nvidia-580:dev modinfo nvidia-modeset
-podman run --rm localhost/dakota-nvidia-580:dev modinfo -F signer nvidia
-podman run --rm localhost/dakota-nvidia-580:dev bootc container lint
+podman run --rm localhost/dakota-inspiron-5490:dev modinfo nvidia
+podman run --rm localhost/dakota-inspiron-5490:dev modinfo nvidia-drm
+podman run --rm localhost/dakota-inspiron-5490:dev modinfo nvidia-uvm
+podman run --rm localhost/dakota-inspiron-5490:dev modinfo nvidia-modeset
+podman run --rm localhost/dakota-inspiron-5490:dev modinfo -F signer nvidia
+podman run --rm localhost/dakota-inspiron-5490:dev bootc container lint
 
 # The built image contains both the kernel's vmlinux and the modules, so
 # the struct module ABI check can be re-run against the finished image —
 # nvidia-builder already gated the build on it, but this confirms it
 # end-to-end on what actually shipped:
 podman run --rm -v "$PWD/scripts/module-abi.py:/module-abi.py:ro,Z" \
-  localhost/dakota-nvidia-580:dev sh -c '
+  localhost/dakota-inspiron-5490:dev sh -c '
     kver="$(basename "$(ls -d /usr/lib/modules/*/ | head -n1)")"
     python3 /module-abi.py extract "$kver" \
         "/usr/lib/modules/$kver/vmlinux" /tmp/abi.json
@@ -1545,9 +1580,9 @@ gnome-pure-toggle` above to switch to stock GNOME.
 ## Using it on a real Dakota host
 
 ```bash
-sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580:stable
+sudo bootc switch ghcr.io/lbssousa/dakota-inspiron-5490:stable
 # or the gaming variant:
-sudo bootc switch ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
+sudo bootc switch ghcr.io/lbssousa/dakota-inspiron-5490-gaming:stable
 # or, if the official image already has the ujust recipe:
 ujust rebase-helper
 ```
@@ -1593,13 +1628,13 @@ to check against — the name is misleading here, verification against
 
 ```bash
 cosign verify --key cosign.pub --insecure-ignore-tlog=true \
-  ghcr.io/lbssousa/dakota-nvidia-580:stable
+  ghcr.io/lbssousa/dakota-inspiron-5490:stable
 cosign verify --key cosign.pub --insecure-ignore-tlog=true \
-  ghcr.io/lbssousa/dakota-nvidia-580-gaming:stable
+  ghcr.io/lbssousa/dakota-inspiron-5490-gaming:stable
 
 # SBOM attestation:
 cosign verify-attestation --key cosign.pub --type spdxjson --insecure-ignore-tlog=true \
-  ghcr.io/lbssousa/dakota-nvidia-580:stable
+  ghcr.io/lbssousa/dakota-inspiron-5490:stable
 ```
 
 The signing key itself is never committed — CI holds it as the
@@ -1618,8 +1653,8 @@ split, including the tag names and the clock times (see
 
 - **`:testing` — `.github/workflows/build.yml`.** Runs a two-way matrix
   (`standard`, `gaming`) from the same `Containerfile`, building and
-  publishing both `ghcr.io/lbssousa/dakota-nvidia-580:testing` and
-  `ghcr.io/lbssousa/dakota-nvidia-580-gaming:testing` on push to
+  publishing both `ghcr.io/lbssousa/dakota-inspiron-5490:testing` and
+  `ghcr.io/lbssousa/dakota-inspiron-5490-gaming:testing` on push to
   `main`, on a daily schedule (13:00 UTC), and via
   `workflow_dispatch`. Each
   matrix leg resolves its base image by reading the
@@ -1696,9 +1731,8 @@ split, including the tag names and the clock times (see
   it has no pin of its own to drift. Deliberate behaviors:
   - **It never proposes a branch change.** NVIDIA publishes newer
     branches (590/595/610/615 at the time of writing) which still list
-    this repo's target Pascal GPUs as current, but moving to one would
-    make the `580` in the repo and image names wrong and require
-    re-deriving the kernel-7.x workarounds. A newer branch is mentioned
+    the notebook's Pascal MX230 as current, but moving to one would
+    require re-deriving the kernel-7.x workarounds. A newer branch is mentioned
     in the PR body and the run summary, and left as a manual decision.
   - **It won't downgrade**, and it won't propose a release whose
     `x86_64` installer isn't downloadable yet (a release directory can
@@ -1755,7 +1789,7 @@ token** as the repository secret `NVIDIA_WATCH_PR_TOKEN`:
 
 1. <https://github.com/settings/personal-access-tokens/new>
 2. **Resource owner**: your own account. **Repository access**: *Only
-   select repositories* → `dakota-nvidia-580`. Not "All repositories" —
+   select repositories* → `dakota-inspiron-5490`. Not "All repositories" —
    this token can push branches and open PRs, so keep its reach to the
    one repo that needs it.
 3. **Repository permissions** — exactly two, everything else *No access*:

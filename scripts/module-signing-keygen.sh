@@ -34,8 +34,8 @@ x509_extensions = ext
 
 [dn]
 O = lbssousa
-OU = dakota-nvidia-580
-CN = dakota-nvidia-580 module signing key
+OU = dakota-inspiron-5490
+CN = dakota-inspiron-5490 module signing key
 
 [ext]
 basicConstraints = critical,CA:FALSE

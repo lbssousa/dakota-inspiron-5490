@@ -1,7 +1,7 @@
 [Unit]
 Description=Switch existing users' login shell from bash to fish (once)
 Documentation=file:///usr/libexec/fish-default-shell-migrate
-ConditionPathExists=!/var/lib/dakota-nvidia-580/fish-default-shell-migrated
+ConditionPathExists=!/var/lib/dakota-inspiron-5490/fish-default-shell-migrated
 After=local-fs.target systemd-sysusers.service
 Before=systemd-user-sessions.service
 

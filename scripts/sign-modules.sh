@@ -28,7 +28,7 @@ key="$4"
 kver="$(cat /kernel-version)"
 sign_file="${kernel_src_root}/lib/modules/${kver}/build/scripts/sign-file"
 moddir="${out_dir}/usr/lib/modules/${kver}/extra"
-certdir="${out_dir}/usr/lib/dakota-nvidia-580/secure-boot"
+certdir="${out_dir}/usr/lib/dakota-inspiron-5490/secure-boot"
 
 mkdir -p "${certdir}"
 openssl x509 -in "${cert}" -outform DER -out "${certdir}/module-signing.der"

@@ -5,7 +5,7 @@
 # goes back to bash with chsh is left alone on every boot after that.
 set -euo pipefail
 
-marker=/var/lib/dakota-nvidia-580/fish-default-shell-migrated
+marker=/var/lib/dakota-inspiron-5490/fish-default-shell-migrated
 fish=/usr/bin/fish
 
 [ -e "$marker" ] && exit 0
