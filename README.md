@@ -700,8 +700,14 @@ actually fix:
    makes the screen occasionally come up with no password/fingerprint
    field at all, impossible to unlock without a hard reboot.
 
-Part 2 is very likely a `dbus-broker`/systemd bug in the Dakota (GNOME
-OS) base image itself — not this repo's code, and not fixed here.
+**Revised 2026-11-02:** part 2 is unproven, and its wording was wrong about
+the bus: this system runs `dbus-daemon`, not `dbus-broker`. The cap being
+reached is confirmed, but what fills it may rather be a flood of
+`gdm-session-worker` processes, each holding a root connection. The incident
+of 2026-11-01 happened with `fprintd` already resident, so `--no-timeout` did
+not prevent it, and before any fingerprint had been enrolled, so there was
+nothing for the sensor to verify. The cause is still open; `bluefin-dakota-setup`'s `gdm-worker-watchdog` records each flood.
+
 Part 1, though, is one of that leak's most frequent and mechanically
 regular triggers on this hardware (a clockwork timeout every 15
 minutes, all day, regardless of activity), and *is* in scope: the
@@ -1476,8 +1482,8 @@ reconstructs itself from upstream source + the image's own shipped
   itself (the `goodixtls53xd` SIGFM matcher) — this image-build repo
   only bundles that fork's build output, so it can't fix this on its
   own; track/fix it in that repo instead.
-- **System-bus D-Bus connection leak on activation timeout (not this
-  repo's bug, not fixed here)** — see ["Lock screen occasionally shows
+- **Root's system-bus connections running out (cause not established, not
+  fixed here)** — see ["Lock screen occasionally shows
   no password/fingerprint prompt"](#lock-screen-occasionally-shows-no-passwordfingerprint-prompt).
   `files/fprintd-no-timeout.conf` removes fingerprint re-arm as one
   trigger, but any other D-Bus service-activation timeout (observed
