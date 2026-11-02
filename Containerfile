@@ -780,6 +780,24 @@ RUN cd /usr/lib/systemd/system && \
 # showing no password/fingerprint prompt at all.
 COPY files/fprintd-no-timeout.conf /usr/lib/systemd/system/fprintd.service.d/10-no-timeout.conf
 
+# Kills the excess when gdm-session-worker processes pile up on the lock
+# screen, before they use up root's system-bus connections and take the
+# password prompt with them; never a session leader. Contains the flood, its
+# cause is still open: see README.md, "Lock screen occasionally shows no
+# password/fingerprint prompt". Enabled by a /usr symlink, not a preset — see
+# the NVIDIA units above. Fail here if a base bump drops a tool it depends on,
+# since at runtime that would only show up as a watchdog that never acts.
+COPY files/gdm-worker-watchdog.sh /usr/libexec/gdm-worker-watchdog
+COPY files/gdm-worker-watchdog.service /usr/lib/systemd/system/gdm-worker-watchdog.service
+RUN set -eux; \
+    ln -s ../gdm-worker-watchdog.service \
+        /usr/lib/systemd/system/multi-user.target.wants/; \
+    test -x /usr/libexec/gdm-worker-watchdog; \
+    bash -n /usr/libexec/gdm-worker-watchdog; \
+    for tool in pgrep awk getconf busctl journalctl loginctl ps timeout; do \
+        command -v "$tool"; \
+    done
+
 # Makes a YubiKey that was already plugged in at boot visible to GnuPG
 # (`gpg --card-status`) without hand-restarting pcscd first. Replaces
 # the stock p11-kit module file registering OpenSC globally, whose own

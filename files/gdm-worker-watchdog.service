@@ -1,0 +1,25 @@
+# Contains gdm-session-worker floods on the GNOME lock screen. Limits and the
+# reasoning behind them are in /usr/libexec/gdm-worker-watchdog; see README.md,
+# "Lock screen occasionally shows no password/fingerprint prompt".
+[Unit]
+Description=Contain gdm-session-worker floods on the GNOME lock screen
+After=gdm.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/gdm-worker-watchdog
+LogsDirectory=gdm-worker-watchdog
+# Root only: the GDM journal copied into each record states the password length.
+LogsDirectoryMode=0700
+Restart=always
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+# CAP_SYS_PTRACE: the workers' fds and wchan, for each flood's record.
+CapabilityBoundingSet=CAP_KILL CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

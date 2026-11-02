@@ -706,7 +706,24 @@ reached is confirmed, but what fills it may rather be a flood of
 `gdm-session-worker` processes, each holding a root connection. The incident
 of 2026-11-01 happened with `fprintd` already resident, so `--no-timeout` did
 not prevent it, and before any fingerprint had been enrolled, so there was
-nothing for the sensor to verify. The cause is still open; `bluefin-dakota-setup`'s `gdm-worker-watchdog` records each flood.
+nothing for the sensor to verify. The cause is still open.
+
+The image ships `gdm-worker-watchdog.service` to contain these floods, not to
+prevent them. Every 2 seconds it counts the workers and kills the excess, never
+a session leader, whose name and cgroup match the others' but which would take
+the session with it. Leaders come from `/run/systemd/sessions`, since `loginctl`
+would fail just when the bus is exhausted. On 2026-11-02 at 12:01 a flood reached
+116 workers, and an earlier version of the service killed 113. Each worker used
+about 2 connections, so the cap arrives at around 115 workers; the shipped limits
+therefore act on the first reading from 60 workers up. The flood did not recur
+in the 6 locks of the next boot (about 5.5 hours, with suspends, unlocking by
+fingerprint and by password), but the service never had to act there, so these
+limits have not met a real flood, and that boot does not show the cause is gone.
+
+To check on it, `journalctl -u gdm-worker-watchdog` shows the count once it
+passes 6 and every action. Each flood also writes a record to
+`/var/log/gdm-worker-watchdog`, root only, because the GDM journal it copies
+states the password length. `systemctl mask gdm-worker-watchdog` turns it off.
 
 Part 1, though, is one of that leak's most frequent and mechanically
 regular triggers on this hardware (a clockwork timeout every 15
@@ -1494,7 +1511,9 @@ reconstructs itself from upstream source + the image's own shipped
   way, `busctl list --system | wc -l` climbing well past normal and
   `journalctl` showing `"maximum number of active connections for
   UID 0"` confirms it — the only known full recovery once hit is a
-  reboot.
+  reboot. `gdm-worker-watchdog.service` keeps `gdm-session-worker` floods
+  from getting there, but connections held by anything else are out of its
+  reach.
 - **`nvidia-installer` flags** — they change between branches, so
   they are re-validated against `--help`/`--advanced-options` on every
   `NVIDIA_VERSION` change. All nineteen currently passed were confirmed
