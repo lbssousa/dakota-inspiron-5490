@@ -853,8 +853,19 @@ RUN set -eux; \
 COPY files/nvidia-kargs.toml /usr/lib/bootc/kargs.d/30-nvidia.toml
 
 # `ujust gnome-pure-toggle`: per-user switch between stock GNOME and
-# Bluefin's desktop defaults (see the recipe for details).
+# Bluefin's desktop defaults (see the recipe for details), and the
+# `ujust yubikey-*` recipes below.
 COPY files/60-custom.just /usr/share/ublue-os/just/60-custom.just
+# `ujust yubikey-u2f`, `yubikey-gpg`, `yubikey-ssh`: interactive YubiKey
+# management (pam_u2f keys, the OpenPGP card's key, resident SSH keys); see
+# files/yubikey-manage. The build fails if a tool it drives goes missing.
+COPY files/yubikey-manage /usr/libexec/dakota-inspiron-5490/yubikey-manage
+RUN set -eux; \
+    chmod 0755 /usr/libexec/dakota-inspiron-5490/yubikey-manage; \
+    for c in gum python3 fido2-token fido2-assert pamu2fcfg gpg gpgconf ssh-keygen; do \
+        command -v "$c"; \
+    done; \
+    bash -n /usr/libexec/dakota-inspiron-5490/yubikey-manage
 
 # Login shells: fish (from the base) is the default for every regular
 # account; bash stays installed and both are listed in /etc/shells, so

@@ -132,3 +132,24 @@ nvidia-secure-boot-status:
     else
         echo "nvidia module:    NOT loaded — see 'journalctl -k -b | grep -i -e nvidia -e lockdown'"
     fi
+
+# YubiKey (or another FIDO2 / OpenPGP card security key), for the logged-in
+# user. Each recipe shows the key's state and a menu; an ACTION runs one step
+# directly. Logic in /usr/libexec/dakota-inspiron-5490/yubikey-manage
+# (files/yubikey-manage), ported from lbssousa/security-key-omarchy and
+# lbssousa/omarchy-yubikey.
+
+# Register the key for sudo and polkit (pam_u2f): ACTION = status, register, remove, pin-on, pin-off
+[group('YubiKey')]
+yubikey-u2f ACTION="":
+    @/usr/libexec/dakota-inspiron-5490/yubikey-manage u2f {{ ACTION }}
+
+# Import the OpenPGP key on the card into gpg: ACTION = status, import, trust, remove
+[group('YubiKey')]
+yubikey-gpg ACTION="":
+    @/usr/libexec/dakota-inspiron-5490/yubikey-manage gpg {{ ACTION }}
+
+# Copy the key's resident SSH keys into ~/.ssh: ACTION = status, import, host, remove
+[group('YubiKey')]
+yubikey-ssh ACTION="":
+    @/usr/libexec/dakota-inspiron-5490/yubikey-manage ssh {{ ACTION }}

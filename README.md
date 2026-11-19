@@ -831,6 +831,78 @@ gpg --card-status        # must still see the card
 (`p11-kit` itself is deliberately left out of `enable-in`, which is
 what makes the first command a meaningful check.)
 
+## Managing the YubiKey: `ujust yubikey-*`
+
+Three interactive recipes manage a YubiKey (or another FIDO2 / OpenPGP
+card security key) for the logged-in user, without privileges except
+where noted. They are a terminal port of the Omarchy shell overlay in
+[lbssousa/security-key-omarchy](https://github.com/lbssousa/security-key-omarchy),
+with the staged OpenPGP import of
+[lbssousa/omarchy-yubikey](https://github.com/lbssousa/omarchy-yubikey).
+Each one shows the key's state, then a menu (`gum`); an argument runs one
+step directly. The logic lives in `files/yubikey-manage`, installed as
+`/usr/libexec/dakota-inspiron-5490/yubikey-manage`; the recipes in
+`files/60-custom.just` only call it. PINs and passphrases go straight
+to the tool that asks for them (`pamu2fcfg`, gpg's pinentry,
+`ssh-keygen`), never through the script.
+
+```bash
+ujust yubikey-u2f    # status | register | remove | pin-on | pin-off
+ujust yubikey-gpg    # status | import | trust | remove
+ujust yubikey-ssh    # status | import | host | remove
+```
+
+- **`yubikey-u2f`, signing in with the key.** It finds the `pam_u2f.so`
+  lines sudo and polkit reach (on Dakota both include
+  `/etc/pam.d/system-auth`) and only registers a key where they read:
+  `~/.config/Yubico/u2f_keys` when the line has no `authfile=`, with
+  the line's `origin=`/`appid=` passed to `pamu2fcfg`. A key already
+  registered is recognised without a touch (`fido2-assert -t up=false`),
+  and the removal menu marks which entry belongs to the key plugged in.
+  `pin-on`/`pin-off` set whether sudo and polkit ask for the key's PIN
+  along with the touch, changing only `pinverification=` and
+  `userpresence=` on those lines, through `sudo`, with a timestamped
+  backup next to the file; `pin-on` is refused for a key with no PIN,
+  which could never sign in. Putting `pam_u2f` into PAM in the first
+  place stays out of the image, as above:
+  [`playbooks/dakota/yubikey.yml`](https://github.com/lbssousa/bluefin-initial-setup/blob/main/playbooks/dakota/yubikey.yml)
+  (tag `yubikey-setup-pam`) adds the `system-auth` line and the
+  `polkit-agent-helper@.service` drop-in that lets polkit's sandboxed
+  helper reach the key. The status says when either is missing.
+- **`yubikey-gpg`, the OpenPGP key on the card.** `import` fetches the
+  public key into a private, temporary keyring, from the URL stored on
+  the card (`gpg --card-edit`, `admin`, `url`) or else the keyservers
+  in `~/.gnupg/dirmngr.conf`, and only copies it into your keyring when
+  it holds every key on the card. Reading the card again links the key
+  to it. It then offers to trust it ultimately and to have git sign
+  commits and tags with it. Run again, it updates the key (a new expiry
+  date, new subkeys). `remove` takes it out of the keyring again, and
+  refuses when gpg keeps a secret part of it on disk.
+- **`yubikey-ssh`, resident SSH keys.** `import` runs `ssh-keygen -K`
+  in a private directory under `$XDG_RUNTIME_DIR` and copies complete
+  pairs into `~/.ssh` (0600/0644), never over a file already there.
+  For a key whose application names a git host (`ssh:github.com`,
+  `ssh:login@git.example.org:2222`), it offers
+  `~/.ssh/config.d/<host>.conf` (`IdentityFile`, `IdentitiesOnly yes`,
+  `IdentityAgent none`) and puts `Include config.d/*.conf` at the top
+  of `~/.ssh/config`; it also asks for how many minutes (0 to 1440, 0 by
+  default) to keep an authenticated connection open for later ones to
+  reuse without the PIN or a touch. Host files changed by hand, or not
+  written by the recipe, are left alone. `remove` deletes a copy (the
+  security key keeps the key) and takes it out of its host file.
+
+Not ported from the overlay: making new resident SSH keys and deleting
+them from the security key, both of which `ssh-keygen -O resident` and
+`fido2-token -D` do directly.
+
+`tests/yubikey-manage-test.sh` runs the three recipes inside the built
+image, with the security key stubbed (`fido2-token`, `fido2-assert`,
+`pamu2fcfg`, `ssh-keygen -K`, the card behind `gpg --card-status`) and
+everything else real: gpg imports a key served over HTTP into a
+throwaway keyring, `ssh -G` reads the host file, PAM files sit in a
+temporary directory. CI runs it after every build, before the push,
+along with shellcheck.
+
 ## How the NVIDIA userspace libraries are installed
 
 Same `lib`-vs-`lib64` ambiguity as libfprint/pam-u2f above, but it went
