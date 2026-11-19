@@ -1,0 +1,998 @@
+#!/usr/bin/bash
+# Manages a YubiKey (or another FIDO2 / OpenPGP card security key) for the
+# `ujust yubikey-*` recipes, as the logged-in user. It drives the same tools a
+# terminal would: pamu2fcfg, fido2-token, fido2-assert, gpg and ssh-keygen,
+# and asks with gum. Ported from lbssousa/security-key-omarchy (the Omarchy
+# shell overlay) and lbssousa/omarchy-yubikey:
+#
+#   yubikey-manage u2f [status|enable|disable|register|remove|pin-on|pin-off]
+#       Signing in with the key (pam_u2f) for sudo, polkit and the console,
+#       which Dakota all sends through /etc/pam.d/system-auth: turn it on or
+#       off (the PAM line and polkit's sandbox drop-in, through sudo),
+#       register the key plugged in, remove one, and whether they ask for its
+#       PIN along with the touch.
+#   yubikey-manage gpg [status|import|trust|remove]
+#       The OpenPGP key on the card: import (or update) its public key from the
+#       card's URL or a keyserver, link it to the card, trust it, take it out
+#       of the keyring again.
+#   yubikey-manage ssh [status|import|host|remove]
+#       Resident SSH keys: copy them into ~/.ssh with `ssh-keygen -K`, never
+#       over a file already there, and set up the git host a key names.
+#
+# With no action it shows the status and a menu. PINs and passphrases go
+# straight to the tool that asks for them; this script never sees them.
+# Messages name paths the way the user types them (~/.ssh/…).
+# shellcheck disable=SC2088
+set -euo pipefail
+
+# Overridable for tests only.
+# shellcheck disable=SC2206
+pam_dirs=(${YUBIKEY_PAM_DIRS:-/etc/pam.d /usr/lib/pam.d})
+ssh_dir="${YUBIKEY_SSH_DIR:-$HOME/.ssh}"
+# pam_u2f's own default, when its line has no authfile=. pam_u2f runs as
+# root (sudo) or in polkit's helper, where XDG_CONFIG_HOME isn't the user's,
+# so it's always under $HOME.
+own_authfile="${YUBIKEY_AUTHFILE:-$HOME/.config/Yubico/u2f_keys}"
+user="${USER:-$(id -un)}"
+# polkit runs PAM in polkit-agent-helper@.service, whose sandbox hides the
+# key's /dev/hidraw* node and $HOME; this drop-in opens what pam_u2f needs.
+# Same file bluefin-initial-setup's yubikey-setup-pam writes.
+polkit_dropin="${YUBIKEY_POLKIT_DROPIN:-/etc/systemd/system/polkit-agent-helper@.service.d/yubikey-u2f.conf}"
+# The line `enable` adds: a touch of a registered key is enough, and without
+# a key file (nouserok) PAM goes on to the password.
+u2f_pam_line="auth        sufficient    pam_u2f.so cue nouserok"
+# Tests run as an ordinary user on files in a temporary directory: no sudo,
+# no systemctl, and PAM files outside /etc.
+testing="${YUBIKEY_TEST:-}"
+
+say() { gum style "$*"; }
+note() { gum style --foreground 245 "$*"; }
+ok() { gum style --foreground 82 "✓ $*"; }
+warn() { gum style --foreground 214 "$*" >&2; }
+die() {
+    gum style --foreground 196 "$*" >&2
+    exit 1
+}
+confirm() { gum confirm --default=false "$@"; }
+title() { gum style --bold --foreground 212 "$*"; }
+
+as_root() {
+    if [[ -n $testing ]]; then "$@"; else sudo "$@"; fi
+}
+
+# Replaces a root-owned file with <tmp>, keeping a timestamped backup next to it.
+install_root_file() { # tmp file
+    as_root cp -a "$2" "$2.yubikey-$(date +%Y%m%d%H%M%S)"
+    as_root install -m 0644 "$1" "$2"
+}
+
+need_tty() {
+    [[ -t 0 && -t 1 ]] || die "An interactive terminal is required."
+}
+
+# -- the key -------------------------------------------------------------------
+
+# The FIDO2 device to use: the only one plugged in, or the one picked.
+fido_device() {
+    local -a devices
+    mapfile -t devices < <(fido2-token -L 2>/dev/null | grep -E '^/dev/')
+    case ${#devices[@]} in
+    0) return 1 ;;
+    1) echo "${devices[0]%%:*}" ;;
+    *)
+        local picked
+        picked=$(gum choose --header "Which security key?" "${devices[@]}") || return 1
+        echo "${picked%%:*}"
+        ;;
+    esac
+}
+
+# Whether a FIDO2 device has a PIN set ("clientPin" among its options; a key
+# without one says "noclientPin").
+has_pin() {
+    fido2-token -I "$1" 2>/dev/null | grep -Eq '^options:.*(:|, |\s)clientPin(,|$)'
+}
+
+# -- U2F / pam_u2f -------------------------------------------------------------
+
+pam_file() {
+    local dir
+    for dir in "${pam_dirs[@]}"; do
+        [[ -f $dir/$1 ]] && { echo "$dir/$1"; return 0; }
+    done
+    return 1
+}
+
+# The pam_u2f auth lines a PAM service reaches, following include and
+# substack: "file<TAB>line number<TAB>line".
+pam_u2f_lines() {
+    local file depth=${2:-0} n=0 line
+    file=$(pam_file "$1") || return 0
+    ((depth < 8)) || return 0
+    while IFS= read -r line || [[ -n $line ]]; do
+        n=$((n + 1))
+        local -a w
+        read -ra w <<<"$line"
+        [[ ${#w[@]} -ge 3 && ${w[0]} != \#* ]] || continue
+        [[ ${w[0]#-} == auth ]] || continue
+        local control=${w[1]} i=2
+        # A bracketed control can span words: [success=1 default=ignore].
+        if [[ $control == "["* && $control != *"]" ]]; then
+            while ((i < ${#w[@]})) && [[ ${w[i - 1]} != *"]" ]]; do i=$((i + 1)); done
+        fi
+        local module=${w[i]:-}
+        if [[ $control == include || $control == substack ]]; then
+            pam_u2f_lines "$module" $((depth + 1))
+        elif [[ ${module##*/} == pam_u2f.so ]]; then
+            printf '%s\t%s\t%s\n' "$file" "$n" "$line"
+        fi
+    done <"$file"
+}
+
+# An option of a pam_u2f line ("authfile", "origin"…), or nothing.
+pam_option() {
+    local word
+    for word in $2; do
+        [[ $word == "$1="* ]] && { echo "${word#*=}"; return 0; }
+    done
+    return 0
+}
+
+# The pam_u2f lines sudo and polkit reach, once each.
+u2f_lines() {
+    { pam_u2f_lines sudo; pam_u2f_lines polkit-1; } | sort -u
+}
+
+# Where a key registered now goes, as "<kind><TAB><path>":
+#   own    the user's own list, which sudo and polkit read
+#   none   neither asks for a key yet
+#   other  they read a file only an administrator writes
+#   mixed  they read different files
+u2f_target() {
+    local -a files=()
+    local file line authfile
+    while IFS=$'\t' read -r file _ line; do
+        authfile=$(pam_option authfile "$line")
+        files+=("${authfile:-$own_authfile}")
+    done < <(u2f_lines)
+    if ((${#files[@]} == 0)); then
+        printf 'none\t%s\n' "$own_authfile"
+        return
+    fi
+    mapfile -t files < <(printf '%s\n' "${files[@]}" | sort -u)
+    if ((${#files[@]} > 1)); then
+        printf 'mixed\t\n'
+    elif [[ ${files[0]} == "$own_authfile" ]]; then
+        printf 'own\t%s\n' "$own_authfile"
+    else
+        printf 'other\t%s\n' "${files[0]}"
+    fi
+}
+
+# "on", "off", "mixed" or "" (no pam_u2f): whether sudo and polkit ask for the PIN.
+u2f_pin_mode() {
+    local file line on=0 off=0
+    while IFS=$'\t' read -r file _ line; do
+        if [[ " $line " == *" pinverification=1 "* ]]; then on=1; else off=1; fi
+    done < <(u2f_lines)
+    if ((on && off)); then echo mixed; elif ((on)); then echo on; elif ((off)); then echo off; fi
+}
+
+# The origin (and appid) sudo and polkit check, as pamu2fcfg arguments.
+u2f_origin_args() {
+    local file line origin appid
+    while IFS=$'\t' read -r file _ line; do
+        origin=$(pam_option origin "$line")
+        appid=$(pam_option appid "$line")
+        [[ -n $origin ]] && printf '%s\n' -o "$origin"
+        [[ -n $appid ]] && printf '%s\n' -i "$appid"
+        return 0
+    done < <(u2f_lines)
+}
+
+# The user's credentials in their authfile, one per line.
+u2f_credentials() {
+    [[ -f $own_authfile ]] || return 0
+    awk -v u="$user" -F: '$1 == u { for (i = 2; i <= NF; i++) if ($i != "") print $i }' "$own_authfile"
+}
+
+# Rewrites the authfile with the user's line (dropped when empty) holding the
+# credentials on stdin, atomically and private.
+u2f_write() {
+    local dir tmp creds
+    creds=$(paste -sd: -)
+    dir=$(dirname "$own_authfile")
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    tmp=$(mktemp "$dir/.u2f_keys.XXXXXX")
+    {
+        [[ -f $own_authfile ]] && awk -v u="$user" -F: '$1 != u && NF' "$own_authfile"
+        [[ -n $creds ]] && printf '%s:%s\n' "$user" "$creds"
+    } >"$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$own_authfile"
+}
+
+# Whether the key plugged in made <credential>. It only answers for its own
+# credentials, and up=false asks for no touch.
+u2f_is_from() {
+    local device=$1 credential=$2 origin=$3 handle
+    handle=${credential%%,*}
+    [[ -n $handle && $handle != \** ]] || return 1
+    printf '%s\n%s\n%s\n' "$(head -c 32 /dev/urandom | base64)" "$origin" "$handle" |
+        fido2-assert -G -t up=false "$device" >/dev/null 2>&1
+}
+
+u2f_origin() {
+    local -a args
+    mapfile -t args < <(u2f_origin_args)
+    if [[ ${args[0]:-} == -o ]]; then echo "${args[1]}"; else echo "pam://$(hostname)"; fi
+}
+
+u2f_status() {
+    title "Sign in with the key (pam_u2f)"
+    local kind path mode
+    IFS=$'\t' read -r kind path < <(u2f_target)
+    case $kind in
+    own) say "sudo and polkit accept a registered key ($path)." ;;
+    none) warn "sudo and polkit don't ask for a key yet: turn it on with 'ujust yubikey-u2f enable'." ;;
+    other) warn "sudo and polkit read $path, which only an administrator can change." ;;
+    mixed) warn "sudo and polkit read keys from different files." ;;
+    esac
+    mode=$(u2f_pin_mode)
+    case $mode in
+    on) say "They ask for the key's PIN along with the touch." ;;
+    off) say "A touch is enough (the key may still demand its PIN)." ;;
+    mixed) warn "Only some of them ask for the key's PIN." ;;
+    esac
+    if [[ -n $mode && ! -f $polkit_dropin ]]; then
+        warn "polkit's helper can't reach the key from its sandbox: 'ujust yubikey-u2f enable' fixes that."
+    fi
+    local -a creds
+    mapfile -t creds < <(u2f_credentials)
+    if ((${#creds[@]} == 0)); then
+        say "No keys registered in $own_authfile."
+    else
+        say "Registered keys (${#creds[@]}):"
+        local c
+        for c in "${creds[@]}"; do note "  • ${c:0:10}…"; done
+    fi
+}
+
+u2f_register() {
+    local kind path device origin
+    IFS=$'\t' read -r kind path < <(u2f_target)
+    case $kind in
+    other) die "sudo and polkit read $path: an administrator has to register the key there." ;;
+    mixed) die "sudo and polkit read keys from different files: an administrator has to point them at the same one." ;;
+    none)
+        warn "sudo and polkit don't ask for a key yet."
+        confirm "Turn on signing in with the key first?" || return 0
+        u2f_enable noregister
+        [[ -n $(u2f_lines) ]] || return 0
+        ;;
+    esac
+    device=$(fido_device) || die "Plug in the security key first."
+    if [[ $(u2f_pin_mode) == on ]] && ! has_pin "$device"; then
+        die "sudo and polkit ask for the key's PIN, and this key has none: set one first (fido2-token -S $device)."
+    fi
+    origin=$(u2f_origin)
+    local c
+    while IFS= read -r c; do
+        if u2f_is_from "$device" "$c" "$origin"; then
+            ok "This key is already registered."
+            return 0
+        fi
+    done < <(u2f_credentials)
+
+    local -a args
+    mapfile -t args < <(u2f_origin_args)
+    say "Touch the key when it blinks$(has_pin "$device" && echo ", after typing its PIN")."
+    local out
+    out=$(pamu2fcfg -u "$user" "${args[@]}") || die "pamu2fcfg failed; nothing was registered."
+    local -a new
+    mapfile -t new < <(awk -v u="$user" -F: '$1 == u { for (i = 2; i <= NF; i++) if ($i != "") print $i }' <<<"$out")
+    ((${#new[@]})) || die "pamu2fcfg returned no credential; nothing was registered."
+    { u2f_credentials; printf '%s\n' "${new[@]}"; } | awk -F, '!seen[$1]++' | u2f_write ||
+        die "Couldn't write $own_authfile."
+    ok "Registered. sudo and polkit now take a touch of this key."
+}
+
+u2f_remove() {
+    local -a creds labels
+    mapfile -t creds < <(u2f_credentials)
+    ((${#creds[@]})) || { say "No keys registered."; return 0; }
+    local device="" origin i
+    device=$(fido_device 2>/dev/null) || device=""
+    origin=$(u2f_origin)
+    for i in "${!creds[@]}"; do
+        labels[i]="$((i + 1)). ${creds[i]:0:10}…"
+        if [[ -n $device ]] && u2f_is_from "$device" "${creds[i]}" "$origin"; then
+            labels[i]+=" (the key plugged in)"
+        fi
+    done
+    local picked
+    picked=$(gum choose --header "Remove which key?" "${labels[@]}") || return 0
+    i=$((${picked%%.*} - 1))
+    if ((${#creds[@]} == 1)); then
+        warn "It's your only registered key: sudo and polkit will ask for your password again."
+    fi
+    confirm "Remove key ${creds[i]:0:10}…?" || return 0
+    printf '%s\n' "${creds[@]}" | awk -v drop="${creds[i]}" '$0 != drop' | u2f_write ||
+        die "Couldn't write $own_authfile."
+    ok "Removed."
+}
+
+# Sets pinverification= on the pam_u2f lines sudo and polkit reach, through
+# sudo, with a backup next to each file. Only those two options change.
+u2f_pin() {
+    local want=$1 file n line device
+    local -a lines
+    mapfile -t lines < <(u2f_lines)
+    ((${#lines[@]})) || die "sudo and polkit don't use pam_u2f: turn it on with 'ujust yubikey-u2f enable'."
+    if [[ $want == on ]]; then
+        device=$(fido_device) || die "Plug in the security key, to check it has a PIN."
+        has_pin "$device" || die "This key has no PIN, so it could never sign in: set one first (fido2-token -S $device)."
+    fi
+    local entry
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n line <<<"$entry"
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; copy it to /etc/pam.d first."
+        [[ $line != *\[* ]] || die "Line $n of $file has a bracketed control; change it by hand."
+    done
+    say "This changes how sudo and polkit sign everyone in. Keep a root shell open until you've checked sudo still works."
+    confirm "Have sudo and polkit $([[ $want == on ]] && echo "ask for the PIN along with the touch" || echo "take a touch alone")?" || return 0
+    local -A by_file=()
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n _ <<<"$entry"
+        by_file[$file]+=" $n"
+    done
+    local tmp
+    for file in "${!by_file[@]}"; do
+        tmp=$(mktemp)
+        awk -v lines="${by_file[$file]}" -v want="$want" '
+            BEGIN { n = split(lines, l, " "); for (i = 1; i <= n; i++) edit[l[i]] = 1 }
+            NR in edit {
+                out = ""
+                n = split($0, w, /[ \t]+/)
+                for (i = 1; i <= n; i++)
+                    if (w[i] != "" && w[i] !~ /^(pinverification|userpresence)=/) out = out (out ? " " : "") w[i]
+                out = out " userpresence=1"
+                if (want == "on") out = out " pinverification=1"
+                print out
+                next
+            }
+            { print }' "$file" >"$tmp"
+        install_root_file "$tmp" "$file"
+        rm -f "$tmp"
+    done
+    ok "Done. Check it now in a new terminal: sudo -k; sudo true"
+}
+
+pam_u2f_installed() {
+    [[ -n $testing ]] && return 0
+    compgen -G '/usr/lib*/security/pam_u2f.so' >/dev/null || compgen -G '/usr/lib/*/security/pam_u2f.so' >/dev/null
+}
+
+polkit_dropin_text() {
+    cat <<'EOF'
+# Written by ujust yubikey-u2f (dakota-inspiron-5490): lets pam_u2f in
+# polkit's PAM helper reach the security key. 'ujust yubikey-u2f disable'
+# removes it.
+[Service]
+PrivateDevices=no
+DeviceAllow=char-hidraw rw
+DeviceAllow=/dev/urandom r
+DeviceAllow=/dev/random r
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+EOF
+}
+
+reload_systemd() {
+    [[ -n $testing ]] || sudo systemctl daemon-reload
+}
+
+# Turns signing in with the key on: the pam_u2f line in system-auth, after
+# the fingerprint and before the password (or just before the password),
+# and polkit's sandbox drop-in. Each only when missing. "noregister" skips
+# the offer to register a key afterwards.
+u2f_enable() {
+    pam_u2f_installed || die "pam_u2f.so isn't installed in this image."
+    local file n where="" need_line=0 need_dropin=0
+    [[ -n $(u2f_lines) ]] || need_line=1
+    [[ -f $polkit_dropin ]] || need_dropin=1
+    if ((!need_line && !need_dropin)); then
+        ok "Signing in with the key is already on."
+        return 0
+    fi
+    if ((need_line)); then
+        file=$(pam_file system-auth) || die "There's no system-auth PAM file to add pam_u2f to."
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; copy it to /etc/pam.d first."
+        n=$(grep -nE '^-?auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$file" | head -n1 | cut -d: -f1 || true)
+        if [[ -n $n ]]; then
+            where=after
+        else
+            n=$(grep -nE '^-?auth[[:space:]].*pam_unix\.so' "$file" | head -n1 | cut -d: -f1 || true)
+            where=before
+        fi
+        [[ -n $n ]] || die "$file has no pam_fprintd or pam_unix auth line to place pam_u2f by; add it by hand."
+    fi
+    say "This turns on signing in with a touch of a registered key, for everyone on this machine:"
+    ((need_line)) && note "  • $file gets \"auth sufficient pam_u2f.so cue nouserok\" $([[ $where == after ]] && echo "after the fingerprint, " )before the password. sudo, polkit (pkexec, run0) and the console take the key; GDM's login and lock screens don't. Without a registered key, the password works as before."
+    ((need_dropin)) && note "  • polkit's PAM helper may reach the key: its sandbox opens hidraw devices and a read-only \$HOME ($polkit_dropin)."
+    say "Keep a root shell open until you've checked sudo still works."
+    confirm "Turn it on?" || return 0
+    local tmp
+    if ((need_line)); then
+        tmp=$(mktemp)
+        awk -v n="$n" -v where="$where" -v add="$u2f_pam_line" \
+            'NR == n && where == "before" { print add } { print } NR == n && where == "after" { print add }' "$file" >"$tmp"
+        install_root_file "$tmp" "$file"
+        rm -f "$tmp"
+    fi
+    if ((need_dropin)); then
+        tmp=$(mktemp)
+        polkit_dropin_text >"$tmp"
+        as_root install -D -m 0644 "$tmp" "$polkit_dropin"
+        rm -f "$tmp"
+        reload_systemd
+    fi
+    [[ -n $(u2f_lines) ]] || die "sudo and polkit still don't reach pam_u2f: check that they include system-auth."
+    ok "On. Check it in a new terminal: sudo -k; sudo true"
+    if [[ ${1:-} != noregister && -z $(u2f_credentials) ]] && confirm "No key is registered yet. Register the key plugged in now?"; then
+        u2f_register
+    fi
+}
+
+# Turns it off: every pam_u2f line sudo and polkit reach (with
+# bluefin-initial-setup's markers around it), and polkit's drop-in. The
+# registered keys stay in their file, for turning it on again.
+u2f_disable() {
+    local -a lines
+    mapfile -t lines < <(u2f_lines)
+    if ((${#lines[@]} == 0)) && [[ ! -f $polkit_dropin ]]; then
+        ok "Signing in with the key is already off."
+        return 0
+    fi
+    local entry file n line
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n line <<<"$entry"
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; take pam_u2f out of it by hand."
+    done
+    say "sudo, polkit and the console go back to the fingerprint and the password. Your registered keys stay in $own_authfile."
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n line <<<"$entry"
+        note "  • $file, line $n: $line"
+    done
+    [[ -f $polkit_dropin ]] && note "  • $polkit_dropin"
+    confirm "Turn it off?" || return 0
+    local -A by_file=()
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n _ <<<"$entry"
+        by_file[$file]+=" $n"
+    done
+    local tmp
+    for file in "${!by_file[@]}"; do
+        tmp=$(mktemp)
+        awk -v lines="${by_file[$file]}" '
+            BEGIN { n = split(lines, l, " "); for (i = 1; i <= n; i++) drop[l[i]] = 1 }
+            NR in drop { next }
+            /^# (BEGIN|END) yubikey pam_u2f/ { next }
+            { print }' "$file" >"$tmp"
+        install_root_file "$tmp" "$file"
+        rm -f "$tmp"
+    done
+    if [[ -f $polkit_dropin ]]; then
+        as_root rm -f "$polkit_dropin"
+        reload_systemd
+    fi
+    ok "Off."
+}
+
+# -- OpenPGP card --------------------------------------------------------------
+
+# Reads the card: sets card_holder, card_url, card_fprs (populated slots,
+# signature first) and card_serial. Fails without an OpenPGP card.
+gpg_card() {
+    local status key rest
+    status=$(gpg --card-status --with-colons 2>/dev/null) || return 1
+    grep -q '^Reader:.*openpgp-card' <<<"$status" || grep -q '^AID:' <<<"$status" || return 1
+    card_holder="" card_url="" card_fprs=()
+    while IFS=: read -r key rest; do
+        case $key in
+        name)
+            local first=${rest%%:*} last=${rest#*:}
+            last=${last%%:*}
+            card_holder=$(printf '%b' "$first $last")
+            ;;
+        url) card_url=$(printf '%b' "${rest%%:*}") ;;
+        fpr)
+            local f
+            IFS=: read -ra f <<<"$rest"
+            local x
+            for x in "${f[@]}"; do [[ $x =~ ^[0-9A-Fa-f]{40,64}$ ]] && card_fprs+=("${x^^}"); done
+            ;;
+        esac
+    done <<<"$status"
+    card_holder=${card_holder# }
+    card_holder=${card_holder% }
+    ((${#card_fprs[@]})) || return 2
+}
+
+# The primary fingerprint and ownertrust of the key holding <fpr>, in <home>.
+gpg_primary() {
+    local fpr=$1
+    shift
+    # A key gpg doesn't know prints nothing, which isn't a failure here.
+    { gpg "$@" --list-keys --with-colons "$fpr" 2>/dev/null || true; } | awk -F: '
+        $1 == "pub" && !trust { trust = $9 }
+        $1 == "fpr" && !primary { primary = $10 }
+        END { if (primary) print primary, trust }'
+}
+
+# Whether gpg keeps a secret part of <primary> on disk rather than on a card.
+# Field 15 of a stub holds the card's serial ("#" when the card is away); a
+# real secret has "+" or nothing.
+gpg_secret_on_disk() {
+    gpg --list-secret-keys --with-colons "$1" 2>/dev/null |
+        awk -F: '($1 == "sec" || $1 == "ssb") && ($15 == "" || $15 == "+") { found = 1 } END { exit !found }'
+}
+
+gpg_status() {
+    title "OpenPGP key on the card"
+    local rc=0
+    gpg_card || rc=$?
+    case $rc in
+    1) say "No OpenPGP card found (plug in the key; 'gpg --card-status' tells why)."; return 0 ;;
+    2) say "The card holds no OpenPGP key."; return 0 ;;
+    esac
+    [[ -n $card_holder ]] && say "Holder:      $card_holder"
+    say "Signing key: ${card_fprs[0]}"
+    [[ -n $card_url ]] && say "Key URL:     $card_url"
+    local primary trust
+    read -r primary trust < <(gpg_primary "${card_fprs[0]}") || true
+    if [[ -z ${primary:-} ]]; then
+        warn "gpg doesn't know this key yet: import it."
+    else
+        say "In the keyring as $primary$([[ $trust == u ]] && echo ", ultimately trusted" || echo ", not trusted as your own key")."
+    fi
+}
+
+gpg_import() {
+    local rc=0
+    gpg_card || rc=$?
+    ((rc != 1)) || die "No OpenPGP card found. Plug in the key."
+    ((rc != 2)) || die "The card holds no OpenPGP key."
+    local stage
+    stage=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/yubikey-gpg.XXXXXX")
+    chmod 700 "$stage"
+    # Actions run in a subshell of their own (see "run" below).
+    # shellcheck disable=SC2064
+    trap "gpgconf --homedir '$stage' --kill all >/dev/null 2>&1; rm -rf '$stage'" EXIT
+    # The account's keyservers, nothing else of its configuration.
+    local conf="${GNUPGHOME:-$HOME/.gnupg}/dirmngr.conf"
+    if [[ -f $conf ]]; then
+        grep -E '^[[:space:]]*keyserver[[:space:]]' "$conf" >"$stage/dirmngr.conf" || true
+    fi
+
+    # Fetched into a private keyring first: only a certificate holding every
+    # key on the card goes into the account's keyring.
+    local primary="" source
+    for source in url keyserver; do
+        if [[ $source == url ]]; then
+            [[ $card_url =~ ^(https?|hkps?):// ]] || continue
+            say "Fetching the public key from $card_url…"
+            gpg --homedir "$stage" --batch --fetch-keys "$card_url" >/dev/null 2>&1 || { warn "Couldn't fetch it from the card's URL."; continue; }
+        else
+            say "Looking the key up on the keyservers…"
+            gpg --homedir "$stage" --batch --recv-keys "${card_fprs[0]}" >/dev/null 2>&1 || { warn "The keyservers don't have it."; continue; }
+        fi
+        primary=$(gpg_primary "${card_fprs[0]}" --homedir "$stage" | cut -d' ' -f1)
+        local f p ok_all=1
+        for f in "${card_fprs[@]}"; do
+            p=$(gpg_primary "$f" --homedir "$stage" | cut -d' ' -f1)
+            [[ -n $p && $p == "$primary" ]] || ok_all=0
+        done
+        ((ok_all)) && [[ -n $primary ]] && break
+        warn "What came from the $source doesn't hold every key on the card."
+        primary=""
+    done
+    [[ -n $primary ]] || die "Couldn't get the card's public key. Set its URL with 'gpg --card-edit' (admin, url) or publish it to a keyserver."
+    gpg --homedir "$stage" --batch --export "$primary" | gpg --batch --import >/dev/null 2>&1 ||
+        die "gpg couldn't import $primary."
+    # Reading the card again creates the stubs that point gpg at it.
+    gpg --card-status >/dev/null 2>&1 || true
+    ok "Imported $primary and linked it to the card."
+
+    local trust=""
+    read -r _ trust < <(gpg_primary "$primary") || true
+    if [[ $trust != u ]] && confirm "Trust $primary as your own key (ultimate)? Only do this for your own key."; then
+        gpg_trust_key "$primary"
+    fi
+    if command -v git >/dev/null && [[ $(git config --global user.signingkey 2>/dev/null) != "$primary" ]] &&
+        confirm "Sign git commits and tags with this key (git config --global)?"; then
+        git config --global user.signingkey "$primary"
+        git config --global commit.gpgsign true
+        git config --global tag.gpgsign true
+        ok "git signs commits and tags with $primary."
+    fi
+}
+
+gpg_trust_key() {
+    printf '%s:6:\n' "$1" | gpg --import-ownertrust 2>/dev/null || die "Couldn't set the trust."
+    ok "$1 is ultimately trusted."
+}
+
+gpg_trust() {
+    gpg_card || die "No OpenPGP key on a card found."
+    local primary
+    primary=$(gpg_primary "${card_fprs[0]}" | cut -d' ' -f1)
+    [[ -n $primary ]] || die "Import the key first."
+    confirm "Trust $primary as your own key (ultimate)? Only do this for your own key." || return 0
+    gpg_trust_key "$primary"
+}
+
+gpg_remove() {
+    gpg_card || die "No OpenPGP key on a card found."
+    local primary
+    primary=$(gpg_primary "${card_fprs[0]}" | cut -d' ' -f1)
+    [[ -n $primary ]] || { say "gpg doesn't know this key."; return 0; }
+    if gpg_secret_on_disk "$primary"; then
+        die "gpg keeps a secret part of $primary on disk, which would be lost for good: remove it by hand if you mean to."
+    fi
+    say "This takes $primary out of the keyring (public key and card stubs). The key stays on the card."
+    confirm "Remove it?" || return 0
+    local what=--delete-keys
+    [[ -n $(gpg --list-secret-keys --with-colons "$primary" 2>/dev/null) ]] && what=--delete-secret-and-public-keys
+    gpg --batch --yes "$what" "$primary" || die "gpg couldn't remove it."
+    ok "Removed."
+}
+
+# -- resident SSH keys ---------------------------------------------------------
+
+resident_re='^id_(ed25519_sk|ecdsa_sk)_rk(_[A-Za-z0-9._@:-]+)?$'
+marker="# Written by ujust yubikey-ssh (dakota-inspiron-5490); remove this line to keep your edits."
+control_dir="yubikey/control"
+
+# A resident key's application, read from its public key (the comment can be
+# edited), and the git host it names: "application<TAB>login<TAB>host<TAB>port",
+# the last three empty when it names none.
+ssh_application() {
+    python3 -I - "$1" <<'PY'
+import base64, re, sys
+
+TYPES = {"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com"}
+GIT = re.compile(r"(?://)?(?:(?P<login>[A-Za-z0-9][A-Za-z0-9._-]*)@)?"
+                 r"(?P<host>[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+)"
+                 r"(?::(?P<port>[0-9]{1,5}))?/?")
+FORGES = {"github.com", "gitlab.com", "bitbucket.org", "codeberg.org", "git.sr.ht",
+          "gitea.com", "ssh.dev.azure.com", "vs-ssh.visualstudio.com"}
+
+def string(data, at):
+    n = int.from_bytes(data[at:at + 4], "big")
+    if at + 4 + n > len(data):
+        raise ValueError
+    return data[at + 4:at + 4 + n], at + 4 + n
+
+try:
+    with open(sys.argv[1], encoding="ascii") as f:
+        fields = f.read(65536).split()
+    if len(fields) < 2 or fields[0] not in TYPES:
+        raise ValueError
+    blob = base64.b64decode(fields[1], validate=True)
+    name, at = string(blob, 0)
+    if name.decode() != fields[0]:
+        raise ValueError
+    if "ecdsa" in fields[0]:
+        _, at = string(blob, at)
+    _, at = string(blob, at)
+    application = string(blob, at)[0].decode("ascii")
+except (OSError, ValueError, UnicodeError):
+    sys.exit(1)
+login = host = port = ""
+if application.startswith("ssh:"):
+    m = GIT.fullmatch(application[4:])
+    if m and (m["port"] is None or 1 <= int(m["port"]) <= 65535):
+        h = m["host"].lower()
+        if h in FORGES or any("git" in label for label in h.split(".")[:-1]):
+            login, host, port = m["login"] or "git", h, str(int(m["port"])) if m["port"] else ""
+print("\t".join((application, login, host, port)))
+PY
+}
+
+ssh_keys() {
+    local f
+    for f in "$ssh_dir"/id_*_sk_rk*; do
+        [[ -f $f && -f $f.pub && $f != *.pub && ${f##*/} =~ $resident_re ]] && echo "${f##*/}"
+    done
+    return 0
+}
+
+drop_in_text() { # login host port minutes names...
+    local login=$1 host=$2 port=$3 minutes=$4 name
+    shift 4
+    printf '%s\nHost %s\n    User %s\n' "$marker" "$host" "$login"
+    [[ -n $port ]] && printf '    Port %s\n' "$port"
+    for name in $(printf '%s\n' "$@" | sort -u); do printf '    IdentityFile ~/.ssh/%s\n' "$name"; done
+    printf '    IdentitiesOnly yes\n    IdentityAgent none\n'
+    if ((minutes > 0)); then
+        printf '    ControlMaster auto\n    ControlPath ~/.ssh/%s/%%C\n    ControlPersist %sm\n' "$control_dir" "$minutes"
+    else
+        printf '    ControlMaster no\n    ControlPath none\n    ControlPersist no\n'
+    fi
+}
+
+# Sets drop_state to what ~/.ssh/config.d/<host>.conf is: "missing",
+# "foreign" (not ours), "edited" (ours, changed by hand) or "ours"; for ours,
+# also drop_login, drop_port, drop_minutes and drop_names. Not to be called in
+# a command substitution, which would lose them.
+drop_in_state() {
+    local host=$1 path="$ssh_dir/config.d/$1.conf" line
+    drop_state="" drop_login="" drop_port="" drop_minutes=0 drop_names=()
+    [[ -e $path || -L $path ]] || { drop_state=missing; return 0; }
+    [[ -f $path && ! -L $path && $(head -n1 "$path") == "$marker" ]] || { drop_state=foreign; return 0; }
+    while IFS= read -r line; do
+        case $line in
+        "    User "*) drop_login=${line#    User } ;;
+        "    Port "*) drop_port=${line#    Port } ;;
+        "    IdentityFile ~/.ssh/"*) drop_names+=("${line#    IdentityFile ~/.ssh/}") ;;
+        "    ControlPersist "*[0-9]m) drop_minutes=${line#    ControlPersist }; drop_minutes=${drop_minutes%m} ;;
+        esac
+    done <"$path"
+    if [[ -n $drop_login && $(drop_in_text "$drop_login" "$host" "$drop_port" "$drop_minutes" "${drop_names[@]}") == "$(<"$path")" ]]; then
+        drop_state=ours
+    else
+        drop_state=edited
+    fi
+}
+
+# Puts "Include config.d/*.conf" at the top of ~/.ssh/config, where it applies
+# to every host, unless the file includes config.d already.
+ensure_include() {
+    local config="$ssh_dir/config" tmp
+    [[ ! -L $config ]] || die "~/.ssh/config is a symbolic link; add 'Include config.d/*.conf' at its top by hand."
+    if [[ -f $config ]] && grep -Eiq '^[[:space:]]*include[[:space:]]+[^[:space:]]*config\.d/' "$config"; then
+        return 0
+    fi
+    tmp=$(mktemp "$ssh_dir/.config.XXXXXX")
+    { echo "Include config.d/*.conf"; [[ -s $config ]] && { echo; cat "$config"; }; } >"$tmp"
+    chmod "$( [[ -f $config ]] && stat -c %a "$config" || echo 600)" "$tmp"
+    mv -f "$tmp" "$config"
+}
+
+# Writes <host>'s drop-in with <names>, or removes it when there are none.
+write_drop_in() { # login host port minutes names...
+    local host=$2 dir="$ssh_dir/config.d" tmp
+    if (($# == 4)); then
+        rm -f "$dir/$host.conf"
+        return
+    fi
+    mkdir -p "$dir"
+    chmod 700 "$dir"
+    if (($4 > 0)); then
+        mkdir -p "$ssh_dir/$control_dir"
+        chmod 700 "$ssh_dir/${control_dir%%/*}" "$ssh_dir/$control_dir"
+    fi
+    tmp=$(mktemp "$dir/.$host.XXXXXX")
+    drop_in_text "$@" >"$tmp"
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$dir/$host.conf"
+    ensure_include
+}
+
+ask_minutes() {
+    local minutes
+    say "Keep an authenticated connection to $1 open for how many minutes, for later ones to reuse without the PIN or a touch? (0 to 1440; 0 authenticates every connection)" >&2
+    minutes=$(gum input --value "${2:-0}" --placeholder 0) || minutes=${2:-0}
+    if [[ ! $minutes =~ ^[0-9]{1,4}$ ]] || ((10#$minutes > 1440)); then
+        warn "Not a number from 0 to 1440; using 0."
+        minutes=0
+    fi
+    echo "$((10#$minutes))"
+}
+
+# Adds <name> to its git host's drop-in, asking first.
+ssh_use_for_host() {
+    local name=$1 app login host port
+    IFS=$'\t' read -r app login host port < <(ssh_application "$ssh_dir/$name.pub") || return 0
+    [[ -n $host ]] || return 0
+    drop_in_state "$host"
+    case $drop_state in
+    foreign) warn "~/.ssh/config.d/$host.conf wasn't written here; add ~/.ssh/$name to it by hand."; return 0 ;;
+    edited) warn "~/.ssh/config.d/$host.conf was changed by hand; add ~/.ssh/$name to it there."; return 0 ;;
+    ours)
+        if [[ " ${drop_names[*]} " == *" $name "* ]]; then
+            ok "$host already uses $name."
+            return 0
+        fi
+        if [[ $drop_login != "$login" || $drop_port != "$port" ]]; then
+            warn "~/.ssh/config.d/$host.conf uses another login or port; add $name there by hand."
+            return 0
+        fi
+        ;;
+    esac
+    confirm "Use $name for $host (ssh and git, without the agent)?" || return 0
+    local minutes=$drop_minutes
+    [[ $drop_state == missing ]] && minutes=$(ask_minutes "$host" 0)
+    write_drop_in "$login" "$host" "$port" "$minutes" "${drop_names[@]}" "$name"
+    ok "$host uses $name (~/.ssh/config.d/$host.conf)."
+}
+
+ssh_status() {
+    title "Resident SSH keys"
+    local -a keys
+    mapfile -t keys < <(ssh_keys)
+    if ((${#keys[@]} == 0)); then
+        say "No resident keys in ~/.ssh: import them."
+        return 0
+    fi
+    local name app login host port where
+    for name in "${keys[@]}"; do
+        app="" host=""
+        IFS=$'\t' read -r app login host port < <(ssh_application "$ssh_dir/$name.pub") || true
+        where=""
+        if [[ -n $host ]]; then
+            drop_in_state "$host"
+            case $drop_state in
+            ours) [[ " ${drop_names[*]} " == *" $name "* ]] && where=" → $host$( ((drop_minutes)) && echo ", connections reused for ${drop_minutes}m")" || where=" ($host not set up)" ;;
+            missing) where=" ($host not set up)" ;;
+            *) where=" ($host set up by hand)" ;;
+            esac
+        fi
+        say "  • $name  ${app:-?}$where"
+    done
+}
+
+ssh_import() {
+    fido_device >/dev/null || die "Plug in the security key first."
+    local work
+    work=$(mktemp -d "${XDG_RUNTIME_DIR:-/tmp}/yubikey-ssh.XXXXXX")
+    chmod 700 "$work"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$work'" EXIT
+    say "ssh-keygen asks for the key's PIN, then for a passphrase for each copy (empty for none)."
+    (cd "$work" && ssh-keygen -K) || true
+    local -a found imported=() skipped=()
+    mapfile -t found < <(cd "$work" && for f in id_*_sk_rk*; do [[ $f != *.pub && $f =~ $resident_re && -f $f.pub ]] && echo "$f"; done)
+    ((${#found[@]})) || die "No resident keys came from the security key."
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    local name
+    for name in "${found[@]}"; do
+        if [[ -e $ssh_dir/$name || -e $ssh_dir/$name.pub ]]; then
+            skipped+=("$name")
+            continue
+        fi
+        install -m 600 "$work/$name" "$ssh_dir/$name"
+        install -m 644 "$work/$name.pub" "$ssh_dir/$name.pub"
+        imported+=("$name")
+    done
+    for name in "${imported[@]}"; do ok "Imported ~/.ssh/$name"; done
+    for name in "${skipped[@]}"; do note "Kept the ~/.ssh/$name already there."; done
+    for name in "${imported[@]}"; do ssh_use_for_host "$name"; done
+}
+
+ssh_host() {
+    local -a keys
+    mapfile -t keys < <(ssh_keys)
+    ((${#keys[@]})) || die "No resident keys in ~/.ssh: import them first."
+    local name
+    name=$(gum choose --header "Which key?" "${keys[@]}") || return 0
+    local app login host port
+    IFS=$'\t' read -r app login host port < <(ssh_application "$ssh_dir/$name.pub") || die "Can't read ~/.ssh/$name.pub."
+    [[ -n $host ]] || die "$name's application ($app) doesn't name a git host."
+    drop_in_state "$host"
+    if [[ $drop_state == ours && " ${drop_names[*]} " == *" $name "* ]]; then
+        local minutes
+        minutes=$(ask_minutes "$host" "$drop_minutes")
+        write_drop_in "$drop_login" "$host" "$drop_port" "$minutes" "${drop_names[@]}"
+        ok "Connections to $host are reused for ${minutes}m."
+        return 0
+    fi
+    ssh_use_for_host "$name"
+}
+
+ssh_remove() {
+    local -a keys
+    mapfile -t keys < <(ssh_keys)
+    ((${#keys[@]})) || { say "No resident keys in ~/.ssh."; return 0; }
+    local name
+    name=$(gum choose --header "Remove which copy? (the security key keeps the key, so it can be imported again)" "${keys[@]}") || return 0
+    confirm "Remove ~/.ssh/$name and its .pub?" || return 0
+    local app login host port
+    if IFS=$'\t' read -r app login host port < <(ssh_application "$ssh_dir/$name.pub") && [[ -n $host ]]; then
+        drop_in_state "$host"
+        if [[ $drop_state == ours && " ${drop_names[*]} " == *" $name "* ]]; then
+            local -a rest=()
+            local n
+            for n in "${drop_names[@]}"; do [[ $n == "$name" ]] || rest+=("$n"); done
+            write_drop_in "$drop_login" "$host" "$drop_port" "$drop_minutes" "${rest[@]}"
+        elif [[ $drop_state == edited ]]; then
+            warn "~/.ssh/config.d/$host.conf was changed by hand; take $name out of it there."
+        fi
+    fi
+    rm -f "$ssh_dir/$name" "$ssh_dir/$name.pub"
+    ok "Removed the copy."
+}
+
+# -- menus ---------------------------------------------------------------------
+
+# Runs an action in a subshell of its own: its traps clean up when it ends,
+# and a failure ("die") returns to the menu instead of ending everything.
+run() { ("$@") || true; }
+
+menu() { # section
+    local section=$1 choice
+    while :; do
+        echo
+        "${section}_status"
+        echo
+        case $section in
+        u2f)
+            local pin
+            local -a options=()
+            pin=$(u2f_pin_mode)
+            if [[ -z $pin || ! -f $polkit_dropin ]]; then options+=("Turn on signing in with the key"); fi
+            options+=("Register the key plugged in" "Remove a registered key")
+            if [[ -n $pin ]]; then
+                options+=("$([[ $pin == on ]] && echo "Take a touch alone" || echo "Ask for the PIN along with the touch")"
+                    "Turn off signing in with the key")
+            fi
+            choice=$(gum choose --header "What now?" "${options[@]}" "Quit") || return 0
+            case $choice in
+            "Turn on"*) run u2f_enable ;;
+            "Turn off"*) run u2f_disable ;;
+            Register*) run u2f_register ;;
+            Remove*) run u2f_remove ;;
+            Take*) run u2f_pin off ;;
+            Ask*) run u2f_pin on ;;
+            *) return 0 ;;
+            esac
+            ;;
+        gpg)
+            choice=$(gum choose --header "What now?" "Import or update the public key" "Trust it as my own key" \
+                "Remove it from the keyring" "Quit") || return 0
+            case $choice in
+            Import*) run gpg_import ;;
+            Trust*) run gpg_trust ;;
+            Remove*) run gpg_remove ;;
+            *) return 0 ;;
+            esac
+            ;;
+        ssh)
+            choice=$(gum choose --header "What now?" "Import the resident keys" "Use a key for its git host" \
+                "Remove a copy from ~/.ssh" "Quit") || return 0
+            case $choice in
+            Import*) run ssh_import ;;
+            Use*) run ssh_host ;;
+            Remove*) run ssh_remove ;;
+            *) return 0 ;;
+            esac
+            ;;
+        esac
+    done
+}
+
+usage() {
+    sed -n '/^#   yubikey-manage/p' "$0" | sed 's/^#   /usage: /' >&2
+    exit 2
+}
+
+section=${1:-}
+action=${2:-}
+case $section in u2f | gpg | ssh) ;; *) usage ;; esac
+if [[ $action == status ]]; then
+    "${section}_status"
+    exit 0
+fi
+need_tty
+case "$section:$action" in
+*:) menu "$section" ;;
+u2f:enable | u2f:disable | u2f:register | u2f:remove | gpg:import | gpg:trust | gpg:remove | ssh:import | ssh:host | ssh:remove)
+    ("${section}_${action}")
+    ;;
+u2f:pin-on) (u2f_pin on) ;;
+u2f:pin-off) (u2f_pin off) ;;
+*) usage ;;
+esac

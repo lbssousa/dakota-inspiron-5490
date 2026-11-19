@@ -170,6 +170,19 @@ jobs:
         if: always()
         run: rm -f "$RUNNER_TEMP/module-signing.key"
 
+      # The `ujust yubikey-*` recipes, run against the image just built
+      # (its gum, gpg, ssh and python3) with the security key stubbed;
+      # see tests/yubikey-manage-test.sh. Before the push, so a failure
+      # publishes nothing.
+      - name: Test the YubiKey recipes (${{ matrix.variant }})
+        run: |
+          shellcheck -x files/yubikey-manage tests/yubikey-manage-test.sh
+          podman run --rm --network none \
+            -v "$PWD/tests:/tests:ro" \
+            --entrypoint /usr/bin/bash \
+            "${IMAGE_NAME}${{ matrix.tag_suffix }}:${{ steps.stream.outputs.stream_tag }}" \
+            /tests/yubikey-manage-test.sh
+
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         run: |
