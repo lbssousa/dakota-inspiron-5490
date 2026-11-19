@@ -572,7 +572,9 @@ gpg_import() {
     trap "gpgconf --homedir '$stage' --kill all >/dev/null 2>&1; rm -rf '$stage'" EXIT
     # The account's keyservers, nothing else of its configuration.
     local conf="${GNUPGHOME:-$HOME/.gnupg}/dirmngr.conf"
-    [[ -f $conf ]] && grep -E '^[[:space:]]*keyserver[[:space:]]' "$conf" >"$stage/dirmngr.conf" || true
+    if [[ -f $conf ]]; then
+        grep -E '^[[:space:]]*keyserver[[:space:]]' "$conf" >"$stage/dirmngr.conf" || true
+    fi
 
     # Fetched into a private keyring first: only a certificate holding every
     # key on the card goes into the account's keyring.
