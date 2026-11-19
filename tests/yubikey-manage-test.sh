@@ -58,19 +58,30 @@ export PATH="$T/stubs:$PATH"
 tty_run() { script -qec "$(printf '%q ' "$@")" /dev/null </dev/null; }
 
 # ---- U2F ----
-export YUBIKEY_PAM_DIRS="$T/etc $T/lib"
-printf 'auth sufficient pam_rootok.so\nauth include system-auth\n' >"$T/etc/sudo"
-printf 'auth include system-auth\naccount include system-auth\n' >"$T/lib/polkit-1"
-printf 'auth        required      pam_env.so\nauth        sufficient    pam_fprintd.so\nauth       sufficient   pam_u2f.so cue nouserok\nauth        sufficient    pam_unix.so try_first_pass nullok_secure\n' >"$T/etc/system-auth"
+# Dakota's own PAM files, from the image, in a temporary directory.
+export YUBIKEY_TEST=1 YUBIKEY_PAM_DIRS="$T/etc $T/lib" YUBIKEY_POLKIT_DROPIN="$T/systemd/polkit-agent-helper@.service.d/yubikey-u2f.conf"
+cp /etc/pam.d/sudo /etc/pam.d/system-auth "$T/etc/"
+cp /usr/lib/pam.d/polkit-1 "$T/lib/"
+cp "$T/etc/system-auth" "$T/system-auth.orig"
 authfile=$HOME/.config/Yubico/u2f_keys
 : >"$T/key-handles"
 
 out=$("$script" u2f status 2>&1)
-check '[[ $out == *"accept a registered key"* && $out == *"A touch is enough"* && $out == *"No keys registered"* ]]' "u2f status reads pam_u2f through include: $out"
+check '[[ $out == *"yubikey-u2f enable"* ]]' "status on stock Dakota says how to turn it on: $out"
 
+# enable, then register when it offers to.
 echo H1 >"$T/next-handle"
-out=$(tty_run "$script" u2f register 2>&1)
-check '[[ $(<"$authfile") == "tester:H1,PUBKEYH1,es256,+presence" && $(stat -c %a "$authfile") == 600 ]]' "register writes the user's line, 0600: $out"
+out=$(tty_run "$script" u2f enable 2>&1)
+check '[[ $(grep -A1 pam_fprintd.so "$T/etc/system-auth" | tail -n1) == "auth        sufficient    pam_u2f.so cue nouserok" ]]' "enable adds pam_u2f right after the fingerprint: $out"
+check '[[ $(grep -c pam_u2f "$T/etc/system-auth") == 1 ]] && diff <(grep -v pam_u2f "$T/etc/system-auth") "$T/system-auth.orig" >/dev/null' "and changes nothing else"
+check 'grep -qx "PrivateDevices=no" "$YUBIKEY_POLKIT_DROPIN" && grep -qx "DeviceAllow=char-hidraw rw" "$YUBIKEY_POLKIT_DROPIN"' "enable writes polkit's sandbox drop-in"
+check 'ls "$T/etc"/system-auth.yubikey-* >/dev/null 2>&1' "enable backs system-auth up"
+check '[[ $(<"$authfile") == "tester:H1,PUBKEYH1,es256,+presence" && $(stat -c %a "$authfile") == 600 ]]' "enable offers to register, which writes the user's line, 0600: $out"
+
+out=$("$script" u2f status 2>&1)
+check '[[ $out == *"accept a registered key"* && $out == *"A touch is enough"* && $out != *"sandbox"* ]]' "u2f status reads pam_u2f through include: $out"
+out=$(tty_run "$script" u2f enable 2>&1)
+check '[[ $out == *"already on"* && $(grep -c pam_u2f "$T/etc/system-auth") == 1 ]]' "enable twice changes nothing: $out"
 check '[[ $(<"$T/pamu2fcfg-args") == "-u tester " || $(<"$T/pamu2fcfg-args") == "-u tester" ]]' "no origin options without origin= in PAM"
 
 echo H1X >"$T/next-handle"
@@ -105,9 +116,24 @@ sed -i 's|pam_u2f.so cue authfile=/etc/fido2/fido2|pam_u2f.so cue origin=pam://d
 tty_run "$script" u2f register >/dev/null 2>&1
 check '[[ $(<"$T/pamu2fcfg-args") == "-u tester -o pam://dakota -i pam://dakota" ]]' "register passes PAM's origin and appid to pamu2fcfg: $(<"$T/pamu2fcfg-args")"
 
-sed -i '/pam_u2f/d' "$T/etc/system-auth"
+# disable takes out every pam_u2f line and bluefin-initial-setup's markers,
+# and the drop-in, but keeps the keys.
+sed -i '/pam_u2f/i # BEGIN yubikey pam_u2f (playbooks/dakota/yubikey.yml)' "$T/etc/system-auth"
+sed -i '/pam_u2f/a # END yubikey pam_u2f (playbooks/dakota/yubikey.yml)' "$T/etc/system-auth"
+printf 'auth sufficient pam_u2f.so cue\n' >>"$T/etc/sudo"
+out=$(tty_run "$script" u2f disable 2>&1)
+check 'diff "$T/etc/system-auth" "$T/system-auth.orig" >/dev/null && ! grep -q pam_u2f "$T/etc/sudo" && [[ ! -e $YUBIKEY_POLKIT_DROPIN && -s $authfile ]]' "disable restores system-auth, cleans sudo, drops the drop-in, keeps the keys: $out"
+out=$(tty_run "$script" u2f disable 2>&1)
+check '[[ $out == *"already off"* ]]' "disable twice: $out"
+
 out=$(GUM_CONFIRM=1 tty_run "$script" u2f register 2>&1)
-check '[[ $out == *"don'"'"'t ask for a key yet"* ]]' "register warns when PAM has no pam_u2f, and stops on no"
+check '[[ $out == *"don'"'"'t ask for a key yet"* ]] && ! grep -q pam_u2f "$T/etc/system-auth"' "register offers to turn it on first, and stops on no: $out"
+
+# Without a fingerprint line, pam_u2f goes right before the password.
+sed -i '/pam_fprintd/d' "$T/etc/system-auth"
+out=$(GUM_CONFIRM=0 tty_run "$script" u2f enable noregister 2>&1)
+check '[[ $(grep -B1 "pam_unix.so try_first_pass" "$T/etc/system-auth" | head -n1) == "auth        sufficient    pam_u2f.so cue nouserok" ]]' "without pam_fprintd, enable puts it before pam_unix: $out"
+
 
 # ---- SSH ----
 mkdir -p "$HOME/.ssh"; printf 'Host *\n    ServerAliveInterval 30\n' >"$HOME/.ssh/config"; chmod 600 "$HOME/.ssh/config"

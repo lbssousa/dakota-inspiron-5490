@@ -139,7 +139,7 @@ nvidia-secure-boot-status:
 # (files/yubikey-manage), ported from lbssousa/security-key-omarchy and
 # lbssousa/omarchy-yubikey.
 
-# Register the key for sudo and polkit (pam_u2f): ACTION = status, register, remove, pin-on, pin-off
+# Sign in to sudo and polkit with the key (pam_u2f): ACTION = status, enable, disable, register, remove, pin-on, pin-off
 [group('YubiKey')]
 yubikey-u2f ACTION="":
     @/usr/libexec/dakota-inspiron-5490/yubikey-manage u2f {{ ACTION }}

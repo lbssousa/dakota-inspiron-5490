@@ -5,12 +5,12 @@
 # and asks with gum. Ported from lbssousa/security-key-omarchy (the Omarchy
 # shell overlay) and lbssousa/omarchy-yubikey:
 #
-#   yubikey-manage u2f [status|register|remove|pin-on|pin-off]
-#       Keys pam_u2f accepts for sudo and polkit (Dakota sends both through
-#       /etc/pam.d/system-auth): register the key plugged in, remove one, and
-#       whether they ask for its PIN along with the touch. Registering only
-#       writes where PAM reads; wiring pam_u2f into PAM is
-#       bluefin-initial-setup's job (--tags yubikey-setup-pam).
+#   yubikey-manage u2f [status|enable|disable|register|remove|pin-on|pin-off]
+#       Signing in with the key (pam_u2f) for sudo, polkit and the console,
+#       which Dakota all sends through /etc/pam.d/system-auth: turn it on or
+#       off (the PAM line and polkit's sandbox drop-in, through sudo),
+#       register the key plugged in, remove one, and whether they ask for its
+#       PIN along with the touch.
 #   yubikey-manage gpg [status|import|trust|remove]
 #       The OpenPGP key on the card: import (or update) its public key from the
 #       card's URL or a keyserver, link it to the card, trust it, take it out
@@ -34,6 +34,16 @@ ssh_dir="${YUBIKEY_SSH_DIR:-$HOME/.ssh}"
 # so it's always under $HOME.
 own_authfile="${YUBIKEY_AUTHFILE:-$HOME/.config/Yubico/u2f_keys}"
 user="${USER:-$(id -un)}"
+# polkit runs PAM in polkit-agent-helper@.service, whose sandbox hides the
+# key's /dev/hidraw* node and $HOME; this drop-in opens what pam_u2f needs.
+# Same file bluefin-initial-setup's yubikey-setup-pam writes.
+polkit_dropin="${YUBIKEY_POLKIT_DROPIN:-/etc/systemd/system/polkit-agent-helper@.service.d/yubikey-u2f.conf}"
+# The line `enable` adds: a touch of a registered key is enough, and without
+# a key file (nouserok) PAM goes on to the password.
+u2f_pam_line="auth        sufficient    pam_u2f.so cue nouserok"
+# Tests run as an ordinary user on files in a temporary directory: no sudo,
+# no systemctl, and PAM files outside /etc.
+testing="${YUBIKEY_TEST:-}"
 
 say() { gum style "$*"; }
 note() { gum style --foreground 245 "$*"; }
@@ -45,6 +55,16 @@ die() {
 }
 confirm() { gum confirm --default=false "$@"; }
 title() { gum style --bold --foreground 212 "$*"; }
+
+as_root() {
+    if [[ -n $testing ]]; then "$@"; else sudo "$@"; fi
+}
+
+# Replaces a root-owned file with <tmp>, keeping a timestamped backup next to it.
+install_root_file() { # tmp file
+    as_root cp -a "$2" "$2.yubikey-$(date +%Y%m%d%H%M%S)"
+    as_root install -m 0644 "$1" "$2"
+}
 
 need_tty() {
     [[ -t 0 && -t 1 ]] || die "An interactive terminal is required."
@@ -215,7 +235,7 @@ u2f_status() {
     IFS=$'\t' read -r kind path < <(u2f_target)
     case $kind in
     own) say "sudo and polkit accept a registered key ($path)." ;;
-    none) warn "sudo and polkit don't ask for a key yet: run bluefin-initial-setup with --tags yubikey-setup-pam." ;;
+    none) warn "sudo and polkit don't ask for a key yet: turn it on with 'ujust yubikey-u2f enable'." ;;
     other) warn "sudo and polkit read $path, which only an administrator can change." ;;
     mixed) warn "sudo and polkit read keys from different files." ;;
     esac
@@ -225,8 +245,8 @@ u2f_status() {
     off) say "A touch is enough (the key may still demand its PIN)." ;;
     mixed) warn "Only some of them ask for the key's PIN." ;;
     esac
-    if [[ -n $mode && ! -f /etc/systemd/system/polkit-agent-helper@.service.d/yubikey-u2f.conf ]]; then
-        warn "polkit's helper can't reach the key from its sandbox: run bluefin-initial-setup with --tags yubikey-setup-pam."
+    if [[ -n $mode && ! -f $polkit_dropin ]]; then
+        warn "polkit's helper can't reach the key from its sandbox: 'ujust yubikey-u2f enable' fixes that."
     fi
     local -a creds
     mapfile -t creds < <(u2f_credentials)
@@ -246,8 +266,10 @@ u2f_register() {
     other) die "sudo and polkit read $path: an administrator has to register the key there." ;;
     mixed) die "sudo and polkit read keys from different files: an administrator has to point them at the same one." ;;
     none)
-        warn "sudo and polkit don't ask for a key yet, so a registration won't be used until bluefin-initial-setup's yubikey-setup-pam runs."
-        confirm "Register the key in $own_authfile anyway?" || return 0
+        warn "sudo and polkit don't ask for a key yet."
+        confirm "Turn on signing in with the key first?" || return 0
+        u2f_enable noregister
+        [[ -n $(u2f_lines) ]] || return 0
         ;;
     esac
     device=$(fido_device) || die "Plug in the security key first."
@@ -307,7 +329,7 @@ u2f_pin() {
     local want=$1 file n line device
     local -a lines
     mapfile -t lines < <(u2f_lines)
-    ((${#lines[@]})) || die "sudo and polkit don't use pam_u2f: run bluefin-initial-setup with --tags yubikey-setup-pam."
+    ((${#lines[@]})) || die "sudo and polkit don't use pam_u2f: turn it on with 'ujust yubikey-u2f enable'."
     if [[ $want == on ]]; then
         device=$(fido_device) || die "Plug in the security key, to check it has a PIN."
         has_pin "$device" || die "This key has no PIN, so it could never sign in: set one first (fido2-token -S $device)."
@@ -315,7 +337,7 @@ u2f_pin() {
     local entry
     for entry in "${lines[@]}"; do
         IFS=$'\t' read -r file n line <<<"$entry"
-        [[ $file == /etc/* || -n ${YUBIKEY_PAM_DIRS:-} ]] || die "$file is part of the image; copy it to /etc/pam.d first."
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; copy it to /etc/pam.d first."
         [[ $line != *\[* ]] || die "Line $n of $file has a bracketed control; change it by hand."
     done
     say "This changes how sudo and polkit sign everyone in. Keep a root shell open until you've checked sudo still works."
@@ -325,8 +347,7 @@ u2f_pin() {
         IFS=$'\t' read -r file n _ <<<"$entry"
         by_file[$file]+=" $n"
     done
-    local tmp sudo_cmd=sudo
-    [[ -n ${YUBIKEY_PAM_DIRS:-} ]] && sudo_cmd=
+    local tmp
     for file in "${!by_file[@]}"; do
         tmp=$(mktemp)
         awk -v lines="${by_file[$file]}" -v want="$want" '
@@ -342,11 +363,131 @@ u2f_pin() {
                 next
             }
             { print }' "$file" >"$tmp"
-        $sudo_cmd cp -a "$file" "$file.yubikey-$(date +%Y%m%d%H%M%S)"
-        $sudo_cmd install -m 0644 "$tmp" "$file"
+        install_root_file "$tmp" "$file"
         rm -f "$tmp"
     done
     ok "Done. Check it now in a new terminal: sudo -k; sudo true"
+}
+
+pam_u2f_installed() {
+    [[ -n $testing ]] && return 0
+    compgen -G '/usr/lib*/security/pam_u2f.so' >/dev/null || compgen -G '/usr/lib/*/security/pam_u2f.so' >/dev/null
+}
+
+polkit_dropin_text() {
+    cat <<'EOF'
+# Written by ujust yubikey-u2f (dakota-inspiron-5490): lets pam_u2f in
+# polkit's PAM helper reach the security key. 'ujust yubikey-u2f disable'
+# removes it.
+[Service]
+PrivateDevices=no
+DeviceAllow=char-hidraw rw
+DeviceAllow=/dev/urandom r
+DeviceAllow=/dev/random r
+ProtectHome=read-only
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+EOF
+}
+
+reload_systemd() {
+    [[ -n $testing ]] || sudo systemctl daemon-reload
+}
+
+# Turns signing in with the key on: the pam_u2f line in system-auth, after
+# the fingerprint and before the password (or just before the password),
+# and polkit's sandbox drop-in. Each only when missing. "noregister" skips
+# the offer to register a key afterwards.
+u2f_enable() {
+    pam_u2f_installed || die "pam_u2f.so isn't installed in this image."
+    local file n where="" need_line=0 need_dropin=0
+    [[ -n $(u2f_lines) ]] || need_line=1
+    [[ -f $polkit_dropin ]] || need_dropin=1
+    if ((!need_line && !need_dropin)); then
+        ok "Signing in with the key is already on."
+        return 0
+    fi
+    if ((need_line)); then
+        file=$(pam_file system-auth) || die "There's no system-auth PAM file to add pam_u2f to."
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; copy it to /etc/pam.d first."
+        n=$(grep -nE '^-?auth[[:space:]]+sufficient[[:space:]]+pam_fprintd\.so' "$file" | head -n1 | cut -d: -f1 || true)
+        if [[ -n $n ]]; then
+            where=after
+        else
+            n=$(grep -nE '^-?auth[[:space:]].*pam_unix\.so' "$file" | head -n1 | cut -d: -f1 || true)
+            where=before
+        fi
+        [[ -n $n ]] || die "$file has no pam_fprintd or pam_unix auth line to place pam_u2f by; add it by hand."
+    fi
+    say "This turns on signing in with a touch of a registered key, for everyone on this machine:"
+    ((need_line)) && note "  • $file gets \"auth sufficient pam_u2f.so cue nouserok\" $([[ $where == after ]] && echo "after the fingerprint, " )before the password. sudo, polkit (pkexec, run0) and the console take the key; GDM's login and lock screens don't. Without a registered key, the password works as before."
+    ((need_dropin)) && note "  • polkit's PAM helper may reach the key: its sandbox opens hidraw devices and a read-only \$HOME ($polkit_dropin)."
+    say "Keep a root shell open until you've checked sudo still works."
+    confirm "Turn it on?" || return 0
+    local tmp
+    if ((need_line)); then
+        tmp=$(mktemp)
+        awk -v n="$n" -v where="$where" -v add="$u2f_pam_line" \
+            'NR == n && where == "before" { print add } { print } NR == n && where == "after" { print add }' "$file" >"$tmp"
+        install_root_file "$tmp" "$file"
+        rm -f "$tmp"
+    fi
+    if ((need_dropin)); then
+        tmp=$(mktemp)
+        polkit_dropin_text >"$tmp"
+        as_root install -D -m 0644 "$tmp" "$polkit_dropin"
+        rm -f "$tmp"
+        reload_systemd
+    fi
+    [[ -n $(u2f_lines) ]] || die "sudo and polkit still don't reach pam_u2f: check that they include system-auth."
+    ok "On. Check it in a new terminal: sudo -k; sudo true"
+    if [[ ${1:-} != noregister && -z $(u2f_credentials) ]] && confirm "No key is registered yet. Register the key plugged in now?"; then
+        u2f_register
+    fi
+}
+
+# Turns it off: every pam_u2f line sudo and polkit reach (with
+# bluefin-initial-setup's markers around it), and polkit's drop-in. The
+# registered keys stay in their file, for turning it on again.
+u2f_disable() {
+    local -a lines
+    mapfile -t lines < <(u2f_lines)
+    if ((${#lines[@]} == 0)) && [[ ! -f $polkit_dropin ]]; then
+        ok "Signing in with the key is already off."
+        return 0
+    fi
+    local entry file n line
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n line <<<"$entry"
+        [[ $file == /etc/* || -n $testing ]] || die "$file is part of the image; take pam_u2f out of it by hand."
+    done
+    say "sudo, polkit and the console go back to the fingerprint and the password. Your registered keys stay in $own_authfile."
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n line <<<"$entry"
+        note "  • $file, line $n: $line"
+    done
+    [[ -f $polkit_dropin ]] && note "  • $polkit_dropin"
+    confirm "Turn it off?" || return 0
+    local -A by_file=()
+    for entry in "${lines[@]}"; do
+        IFS=$'\t' read -r file n _ <<<"$entry"
+        by_file[$file]+=" $n"
+    done
+    local tmp
+    for file in "${!by_file[@]}"; do
+        tmp=$(mktemp)
+        awk -v lines="${by_file[$file]}" '
+            BEGIN { n = split(lines, l, " "); for (i = 1; i <= n; i++) drop[l[i]] = 1 }
+            NR in drop { next }
+            /^# (BEGIN|END) yubikey pam_u2f/ { next }
+            { print }' "$file" >"$tmp"
+        install_root_file "$tmp" "$file"
+        rm -f "$tmp"
+    done
+    if [[ -f $polkit_dropin ]]; then
+        as_root rm -f "$polkit_dropin"
+        reload_systemd
+    fi
+    ok "Off."
 }
 
 # -- OpenPGP card --------------------------------------------------------------
@@ -788,10 +929,18 @@ menu() { # section
         case $section in
         u2f)
             local pin
+            local -a options=()
             pin=$(u2f_pin_mode)
-            choice=$(gum choose --header "What now?" "Register the key plugged in" "Remove a registered key" \
-                "$([[ $pin == on ]] && echo "Take a touch alone" || echo "Ask for the PIN along with the touch")" "Quit") || return 0
+            if [[ -z $pin || ! -f $polkit_dropin ]]; then options+=("Turn on signing in with the key"); fi
+            options+=("Register the key plugged in" "Remove a registered key")
+            if [[ -n $pin ]]; then
+                options+=("$([[ $pin == on ]] && echo "Take a touch alone" || echo "Ask for the PIN along with the touch")"
+                    "Turn off signing in with the key")
+            fi
+            choice=$(gum choose --header "What now?" "${options[@]}" "Quit") || return 0
             case $choice in
+            "Turn on"*) run u2f_enable ;;
+            "Turn off"*) run u2f_disable ;;
             Register*) run u2f_register ;;
             Remove*) run u2f_remove ;;
             Take*) run u2f_pin off ;;
@@ -838,7 +987,7 @@ fi
 need_tty
 case "$section:$action" in
 *:) menu "$section" ;;
-u2f:register | u2f:remove | gpg:import | gpg:trust | gpg:remove | ssh:import | ssh:host | ssh:remove)
+u2f:enable | u2f:disable | u2f:register | u2f:remove | gpg:import | gpg:trust | gpg:remove | ssh:import | ssh:host | ssh:remove)
     ("${section}_${action}")
     ;;
 u2f:pin-on) (u2f_pin on) ;;

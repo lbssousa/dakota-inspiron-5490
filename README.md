@@ -50,16 +50,14 @@ model, so the repo and images use the model name.
   logged-in user access to the key's hidraw node), already ships in the
   Dakota base, so no `brew install libfido2` is needed; the build fails
   if that ever stops being true.
-  Actually wiring `pam_u2f.so` into `/etc/pam.d` (enabling YubiKey PAM
-  auth) is **out of scope for this image** — this repo only ensures
-  the library and executable exist; see
-  [`playbooks/dakota/yubikey.yml`](https://github.com/lbssousa/bluefin-initial-setup/blob/main/playbooks/dakota/yubikey.yml)
-  in bluefin-initial-setup for the current state of that (as of this
-  writing, deliberately left out there too, since Dakota has no
-  `authselect`) — though `/etc/pam.d/system-auth` on this image's base
-  turns out to be a plain, directly-editable file (confirmed by
-  inspecting the published image), not `authselect`-templated, so that
-  gap may be easier to close than documented there.
+  The image ships it inactive: no PAM file names `pam_u2f.so` until
+  `ujust yubikey-u2f enable` adds it to `/etc/pam.d/system-auth`, a
+  plain file on this base (no `authselect`), along with the sandbox
+  drop-in polkit needs (see ["Managing the YubiKey"](#managing-the-yubikey-ujust-yubikey)).
+  Upstream is adding the same package, also inactive
+  ([projectbluefin/dakota#1901](https://github.com/projectbluefin/dakota/pull/1901));
+  once a base carries it, this build can go, since both install to the
+  same directory.
 - **OpenSSH with a touch-prompt patch** — `ssh`, `ssh-agent` and
   `ssh-keygen` rebuilt from the upstream tarball plus
   `files/openssh-askpass-notify.patch`, which makes `notify_start()`
@@ -835,7 +833,7 @@ what makes the first command a meaningful check.)
 
 Three interactive recipes manage a YubiKey (or another FIDO2 / OpenPGP
 card security key) for the logged-in user, without privileges except
-where noted. They are a terminal port of the Omarchy shell overlay in
+where noted (`sudo`, for the PAM and systemd files of `yubikey-u2f`). They are a terminal port of the Omarchy shell overlay in
 [lbssousa/security-key-omarchy](https://github.com/lbssousa/security-key-omarchy),
 with the staged OpenPGP import of
 [lbssousa/omarchy-yubikey](https://github.com/lbssousa/omarchy-yubikey).
@@ -847,14 +845,41 @@ to the tool that asks for them (`pamu2fcfg`, gpg's pinentry,
 `ssh-keygen`), never through the script.
 
 ```bash
-ujust yubikey-u2f    # status | register | remove | pin-on | pin-off
+ujust yubikey-u2f    # status | enable | disable | register | remove | pin-on | pin-off
 ujust yubikey-gpg    # status | import | trust | remove
 ujust yubikey-ssh    # status | import | host | remove
 ```
 
-- **`yubikey-u2f`, signing in with the key.** It finds the `pam_u2f.so`
-  lines sudo and polkit reach (on Dakota both include
-  `/etc/pam.d/system-auth`) and only registers a key where they read:
+- **`yubikey-u2f`, signing in with the key.** The image ships `pam_u2f`
+  inactive, as upstream does (projectbluefin/dakota#1901 packages it and
+  leaves every PAM stack alone); `enable` turns it on, for everyone on
+  the machine:
+  - `auth sufficient pam_u2f.so cue nouserok` goes into
+    `/etc/pam.d/system-auth`, right after `pam_fprintd` (or right before
+    `pam_unix` without it): fingerprint, then key, then password. sudo,
+    polkit (pkexec, run0 and GNOME's dialogs) and the console login all
+    include `system-auth`, so they all take a touch of a registered key.
+    GDM's login and lock screens don't: `gdm-password` uses
+    `password-auth`. `nouserok` lets anyone with no key file through to
+    the password, so nobody is locked out.
+  - `/etc/systemd/system/polkit-agent-helper@.service.d/yubikey-u2f.conf`
+    opens `polkit-agent-helper@.service`'s sandbox for pam_u2f: hidraw
+    devices, `/dev/urandom` and `/dev/random`, a read-only `$HOME`, and
+    `AF_NETLINK` for libfido2's device lookup. Without it, pam_u2f fails
+    silently in polkit's helper and polkit falls back to the password.
+
+  Both go through `sudo`, each only when missing, with a timestamped
+  backup of `system-auth`. Done in `/etc`, not baked into the image:
+  bootc keeps a locally changed `/etc` file across updates, so a line
+  shipped in the image's `system-auth` would never reach a machine whose
+  copy was already edited, and the sandbox is only opened where someone
+  uses a key. `disable` takes out every `pam_u2f` line sudo and polkit
+  reach (and the `# BEGIN/END yubikey pam_u2f` markers of
+  bluefin-initial-setup's `yubikey-setup-pam`, which wrote the same two
+  things) and the drop-in, and keeps the registered keys.
+
+  It finds the `pam_u2f.so`
+  lines sudo and polkit reach and only registers a key where they read:
   `~/.config/Yubico/u2f_keys` when the line has no `authfile=`, with
   the line's `origin=`/`appid=` passed to `pamu2fcfg`. A key already
   registered is recognised without a touch (`fido2-assert -t up=false`),
@@ -863,12 +888,9 @@ ujust yubikey-ssh    # status | import | host | remove
   along with the touch, changing only `pinverification=` and
   `userpresence=` on those lines, through `sudo`, with a timestamped
   backup next to the file; `pin-on` is refused for a key with no PIN,
-  which could never sign in. Putting `pam_u2f` into PAM in the first
-  place stays out of the image, as above:
-  [`playbooks/dakota/yubikey.yml`](https://github.com/lbssousa/bluefin-initial-setup/blob/main/playbooks/dakota/yubikey.yml)
-  (tag `yubikey-setup-pam`) adds the `system-auth` line and the
-  `polkit-agent-helper@.service` drop-in that lets polkit's sandboxed
-  helper reach the key. The status says when either is missing.
+  which could never sign in. Registering offers `enable` first when
+  sudo and polkit don't use pam_u2f yet, and `enable` offers to
+  register when no key is.
 - **`yubikey-gpg`, the OpenPGP key on the card.** `import` fetches the
   public key into a private, temporary keyring, from the URL stored on
   the card (`gpg --card-edit`, `admin`, `url`) or else the keyservers
@@ -899,8 +921,9 @@ them from the security key, both of which `ssh-keygen -O resident` and
 image, with the security key stubbed (`fido2-token`, `fido2-assert`,
 `pamu2fcfg`, `ssh-keygen -K`, the card behind `gpg --card-status`) and
 everything else real: gpg imports a key served over HTTP into a
-throwaway keyring, `ssh -G` reads the host file, PAM files sit in a
-temporary directory. CI runs it after every build, before the push,
+throwaway keyring, `ssh -G` reads the host file, and `enable`/`disable`
+edit copies of the image's own `sudo`, `polkit-1` and `system-auth` in
+a temporary directory. CI runs it after every build, before the push,
 along with shellcheck.
 
 ## How the NVIDIA userspace libraries are installed
